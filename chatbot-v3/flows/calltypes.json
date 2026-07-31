@@ -1,0 +1,33 @@
+{
+  "id": "calltypes",
+  "name": "Three-Type Call Router",
+  "entry_state": "reception",
+  "greeting": "Hi, thanks for calling. How can I help you today?",
+  "allow_reroute": true,
+  "states": {
+    "reception": {
+      "label": "Reception",
+      "instruction_set": "reception",
+      "context": "reception",
+      "routable": false
+    },
+    "typeA": {
+      "label": "Type A",
+      "instruction_set": "typeA",
+      "context": "typeA",
+      "route_when": "The caller's need matches Type A. (Placeholder - replace with the real Type A description, e.g. the specific topic, intent keywords, or kind of request this line handles.)"
+    },
+    "typeB": {
+      "label": "Type B",
+      "instruction_set": "typeB",
+      "context": "typeB",
+      "route_when": "The caller's need matches Type B. (Placeholder - replace with the real Type B description, e.g. the specific topic, intent keywords, or kind of request this line handles.)"
+    },
+    "typeC": {
+      "label": "Type C",
+      "instruction_set": "typeC",
+      "context": "typeC",
+      "route_when": "The caller's need matches Type C. (Placeholder - replace with the real Type C description, e.g. the specific topic, intent keywords, or kind of request this line handles.)"
+    }
+  }
+}

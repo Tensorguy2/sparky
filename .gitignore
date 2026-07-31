@@ -1,0 +1,64 @@
+# Secrets
+.env
+**/.env
+*.pem
+*credentials*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+venv-*/
+**/venv*/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs / runtime
+*.log
+*.pid
+server.log
+restart.log
+tts_*.log
+chatbot_start.log
+
+# Large / local artifacts
+models/
+*.wav
+*.mp3
+*.pt
+*.bin
+*.onnx
+*.safetensors
+.cache/
+checkpoints/
+filler_cache/
+*.jsonl
+
+# Nested repos / unrelated heavy trees
+avatar/
+chatbot/
+chatbot-v2/
+narrator/
+slideshow/
+qwen_tts_package/
+playground/
+client/
+web/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Runtime session dumps
+chatbot-v3/context/call-*.md
+chatbot-v3/sessions/
+chatbot-v3/data/sessions/
+**/phone_*.json
+**/name_*.json
+**/voices.db
+**/hf_cache
