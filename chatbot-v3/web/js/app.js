@@ -114,6 +114,12 @@ function connectWS() {
 
   ws.onopen = () => {
     connected = true;
+    // After chatbot restart / reconnect, re-arm hands-free mic if the toggle is on.
+    if (handsFreeToggle?.checked && !listenMode) {
+      enableListenMode().catch((err) => {
+        console.warn("Failed to re-enable mic after reconnect:", err);
+      });
+    }
     setHealth(true);
     sessionLoaded = false;
     sendJSON({ type: "load_session", session_id: sessionId });
@@ -739,7 +745,19 @@ function processVad(float32) {
 
 async function enableListenMode() {
   if (listenMode) return;
-  await ensureTtsPlayer();
+
+  // TTS player init must not block mic capture (and can leave AudioContext suspended).
+  try {
+    await ensureTtsPlayer();
+  } catch (err) {
+    console.warn("TTS player init failed; mic will still try to start.", err);
+  }
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    appendSystem("Microphone unavailable (needs a secure context or browser permission).");
+    handsFreeToggle.checked = false;
+    return;
+  }
 
   try {
     micStream = await navigator.mediaDevices.getUserMedia({
@@ -758,6 +776,15 @@ async function enableListenMode() {
   }
 
   micCtx = new AudioContext({ sampleRate: 24000 });
+  // Browsers often start AudioContext suspended until a user gesture / resume().
+  if (micCtx.state === "suspended") {
+    try {
+      await micCtx.resume();
+    } catch (err) {
+      console.warn("AudioContext resume failed:", err);
+    }
+  }
+
   const source = micCtx.createMediaStreamSource(micStream);
   micProcessor = micCtx.createScriptProcessor(4096, 1, 1);
   micProcessor.onaudioprocess = (e) => {
@@ -765,7 +792,12 @@ async function enableListenMode() {
     processVad(e.inputBuffer.getChannelData(0));
   };
   source.connect(micProcessor);
-  micProcessor.connect(micCtx.destination);
+  // Do NOT connect the mic graph to destination. That plays the mic into the
+  // speakers and echoCancellation then nulls the capture — mic looks "dead".
+  const silent = micCtx.createGain();
+  silent.gain.value = 0;
+  micProcessor.connect(silent);
+  silent.connect(micCtx.destination);
 
   listenMode = true;
   inUtterance = false;
@@ -774,6 +806,7 @@ async function enableListenMode() {
   btnMic.classList.add("listening");
   btnMic.classList.remove("recording");
   updateListenStatus();
+  sttStatus.textContent = micCtx.state === "running" ? "Mic on — listening" : "Mic on — tap page if silent";
 }
 
 function disableListenMode() {
