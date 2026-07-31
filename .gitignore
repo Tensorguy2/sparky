@@ -33,6 +33,7 @@ models/
 *.onnx
 *.safetensors
 .cache/
+.hf_cache/
 checkpoints/
 filler_cache/
 *.jsonl
@@ -46,7 +47,7 @@ slideshow/
 qwen_tts_package/
 playground/
 client/
-web/
+/web/
 
 # OS / editor
 .DS_Store

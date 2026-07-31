@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice Chatbot</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <h1>Voice Chatbot</h1>
+      <div class="header-controls">
+        <div id="health-badge" class="badge badge-unknown">Connecting…</div>
+      </div>
+    </header>
+
+    <div class="main-layout">
+      <!-- Sidebar -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-section">
+          <label class="sidebar-label" for="model-select">Model</label>
+          <select id="model-select"></select>
+        </div>
+
+        <div class="sidebar-section">
+          <label class="sidebar-label" for="stt-select">Transcription</label>
+          <select id="stt-select"></select>
+        </div>
+
+        <div class="sidebar-section">
+          <label class="sidebar-label" for="voice-select">Voice</label>
+          <select id="voice-select">
+            <option value="mikey">Mikey (default)</option>
+          </select>
+        </div>
+
+        <div class="sidebar-section">
+          <label class="sidebar-label" for="instruction-select">Instructions</label>
+          <select id="instruction-select">
+            <option value="default">General Assistant</option>
+          </select>
+          <div class="sidebar-btn-row">
+            <button id="btn-edit-instructions" class="btn btn-sm" type="button">Edit</button>
+            <button id="btn-new-instructions" class="btn btn-sm" type="button">New</button>
+            <button id="btn-delete-instructions" class="btn btn-sm btn-danger" type="button">Delete</button>
+          </div>
+        </div>
+
+        <div class="sidebar-section">
+          <label class="sidebar-label" for="context-select">Context</label>
+          <select id="context-select">
+            <option value="default">default</option>
+          </select>
+          <button id="btn-edit-context" class="btn btn-sm" type="button">Edit</button>
+        </div>
+
+        <div class="sidebar-section">
+          <label class="sidebar-label">
+            <input type="checkbox" id="hands-free-toggle" checked />
+            Hands-free mic (just speak)
+          </label>
+        </div>
+
+        <div class="sidebar-section">
+          <label class="sidebar-label">
+            <input type="checkbox" id="tts-toggle" checked />
+            Voice output (TTS)
+          </label>
+        </div>
+
+        <div class="sidebar-section">
+          <label class="sidebar-label">Server</label>
+          <div class="sidebar-btn-row">
+            <button id="btn-restart-chatbot" class="btn btn-sm" type="button" title="Restart voice chatbot">Restart chatbot</button>
+            <button id="btn-restart-tts" class="btn btn-sm" type="button" title="Restart TTS voice server (~30 s)">Restart TTS</button>
+          </div>
+        </div>
+
+        <div class="sidebar-section">
+          <label class="sidebar-label">Conversation</label>
+          <label class="sidebar-label" for="session-select">Saved session</label>
+          <select id="session-select">
+            <option value="last">Last conversation</option>
+          </select>
+          <p id="session-status" class="session-status">Loading…</p>
+          <div class="sidebar-btn-row">
+            <button id="btn-load-session" class="btn btn-sm" type="button" title="Load selected saved conversation">Load</button>
+            <button id="btn-save-session" class="btn btn-sm" type="button" title="Quick-save to current session">Save</button>
+            <button id="btn-save-as" class="btn btn-sm" type="button" title="Save conversation with a name">Save as…</button>
+            <button id="btn-clear" class="btn btn-sm btn-danger" type="button" title="Start a new conversation">New chat</button>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Chat area -->
+      <div class="chat-container">
+        <div class="call-mode-bar">
+          <span class="call-mode-label">Call:</span>
+          <span id="mode-badge" class="badge badge-mode">—</span>
+          <span id="mode-buttons" class="mode-buttons"></span>
+        </div>
+        <div class="chat-messages" id="chat-messages">
+          <div class="chat-empty">Start a conversation by typing or using voice input.</div>
+        </div>
+
+        <div class="chat-input-area">
+          <div class="input-row">
+            <button id="btn-excuse-me" class="btn btn-warn" type="button" disabled
+              title="Stop unstable audio, say &ldquo;Excuse me&rdquo; and replay the reply from the start">
+              Excuse me
+            </button>
+            <button id="btn-mic" class="btn btn-mic" type="button" title="Toggle microphone — speak naturally when on">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
+                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+              </svg>
+            </button>
+            <textarea id="text-input" rows="1" placeholder="Type a message…" autocomplete="off"></textarea>
+            <button id="btn-send" class="btn btn-primary" type="button" title="Send">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+              </svg>
+            </button>
+          </div>
+          <div class="input-status">
+            <span id="stt-status"></span>
+            <span id="llm-status"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Instructions editor modal -->
+    <div class="modal-overlay" id="instructions-modal" hidden>
+      <div class="modal modal-wide">
+        <div class="modal-header">
+          <h2 id="instructions-modal-title">Edit Instructions</h2>
+          <button class="btn-close" id="btn-close-instructions" type="button">&times;</button>
+        </div>
+
+        <label class="field" for="instruction-id-input">
+          <span class="label">ID</span>
+          <input id="instruction-id-input" type="text" placeholder="e.g. technical" />
+        </label>
+
+        <label class="field" for="instruction-name-input">
+          <span class="label">Display name</span>
+          <input id="instruction-name-input" type="text" placeholder="e.g. Technical Expert" />
+        </label>
+
+        <label class="field" for="instruction-prompt-input">
+          <span class="label">System prompt</span>
+          <textarea id="instruction-prompt-input" rows="8" placeholder="Instructions for the model…"></textarea>
+        </label>
+
+        <label class="field" for="instruction-models-input">
+          <span class="label">Per-model settings (JSON)</span>
+          <span class="field-hint">temperature and max_tokens per model ID</span>
+          <textarea id="instruction-models-input" rows="10" spellcheck="false"></textarea>
+        </label>
+
+        <p id="instruction-editor-status" class="modal-status" aria-live="polite"></p>
+
+        <div class="modal-actions">
+          <button class="btn btn-primary" id="btn-save-instructions" type="button">Save</button>
+          <button class="btn" id="btn-cancel-instructions" type="button">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Context editor modal -->
+    <div class="modal-overlay" id="context-modal" hidden>
+      <div class="modal">
+        <div class="modal-header">
+          <h2>Edit Context</h2>
+          <button class="btn-close" id="btn-close-context" type="button">&times;</button>
+        </div>
+        <textarea id="context-editor" rows="20" placeholder="Enter reference context…"></textarea>
+        <div class="modal-actions">
+          <button class="btn btn-primary" id="btn-save-context" type="button">Save</button>
+          <button class="btn" id="btn-cancel-context" type="button">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
