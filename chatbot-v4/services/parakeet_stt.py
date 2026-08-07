@@ -57,27 +57,14 @@ def _load_model():
         return _model
 
 
-def _execution_providers() -> list:
-    """Providers onnxruntime will actually use, in priority order."""
-    try:
-        import onnxruntime as ort
-
-        return list(ort.get_available_providers())
-    except Exception:
-        return []
-
-
 def get_stt_status() -> dict:
-    providers = _execution_providers()
-    on_gpu = "CUDAExecutionProvider" in providers
     return {
         "model": PARAKEET_MODEL_ID,
         "backend": "onnx-asr",
         "onnx_model": ONNX_MODEL_NAME,
-        "device": "cuda" if on_gpu else "cpu",
+        "device": "cpu",
         "compute_type": "onnx",
-        "cuda_devices": 1 if on_gpu else 0,
-        "providers": providers,
+        "cuda_devices": 0,
         "loaded": _loaded and _model is not None,
         "streaming": False,
     }

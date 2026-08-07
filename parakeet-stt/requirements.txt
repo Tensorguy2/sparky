@@ -1,0 +1,8 @@
+onnx-asr[cpu,hub]>=0.12.0
+numpy>=2.0
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+
+# Optional Whisper fallback (GPU): uncomment to enable
+# faster-whisper>=1.0

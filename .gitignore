@@ -63,3 +63,6 @@ chatbot-v3/data/sessions/
 **/name_*.json
 **/voices.db
 **/hf_cache
+
+# Runtime call contexts (v4)
+chatbot-v4/context/call-*.md

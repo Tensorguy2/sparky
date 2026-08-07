@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Parakeet STT</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #76b900; --red: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; justify-content: center; padding: 40px 16px;
+  }
+  main { width: 100%; max-width: 640px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h1 span { color: var(--accent); }
+  #status { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .controls {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px; margin-bottom: 12px;
+  }
+  button {
+    background: var(--accent); color: #0d1117; border: 0; border-radius: 8px;
+    padding: 10px 18px; font-size: 15px; font-weight: 600; cursor: pointer;
+  }
+  button.active { background: var(--red); color: #fff; }
+  select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 12px; font-size: 14px;
+  }
+  .state { font-size: 13px; color: var(--muted); min-width: 90px; }
+  .state.listening { color: var(--accent); }
+  .state.speaking { color: #d29922; }
+  .state.busy { color: #58a6ff; }
+  .state.error { color: var(--red); }
+  #levelWrap {
+    flex: 1; min-width: 120px; height: 6px; background: var(--bg);
+    border-radius: 3px; overflow: hidden;
+  }
+  #levelBar { height: 100%; width: 0%; background: var(--accent); transition: width 60ms linear; }
+  #transcripts { display: flex; flex-direction: column; gap: 8px; }
+  .row {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px;
+  }
+  .row .text { white-space: pre-wrap; }
+  .row .meta { margin-top: 6px; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1><span>Parakeet</span> STT — standalone</h1>
+  <div id="status">loading…</div>
+  <div class="controls">
+    <button id="micBtn">Start microphone</button>
+    <select id="model">
+      <option value="parakeet" selected>parakeet-tdt-0.6b-v2</option>
+      <option value="whisper">whisper large-v3-turbo</option>
+    </select>
+    <div id="levelWrap"><div id="levelBar"></div></div>
+    <div class="state" id="state">idle</div>
+  </div>
+  <div id="transcripts"></div>
+</main>
+<script src="js/app.js"></script>
+</body>
+</html>

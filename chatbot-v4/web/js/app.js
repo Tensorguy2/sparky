@@ -9,9 +9,7 @@
  *  - Session configuration (model, voice, instructions, context)
  */
 
-// ?v= must match index.html's version so a bump there refreshes the whole graph
-import { AudioStreamPlayer } from "./audio-stream.js?v=20260805a";
-import { ClientTTS } from "./client-tts.js?v=20260805a";
+import { AudioStreamPlayer } from "./audio-stream.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -77,120 +75,31 @@ let sessionLoaded = false;
 /** @type {AudioStreamPlayer | null} */
 let ttsPlayer = null;
 
-// Client-side TTS: bypass server sentence buffer. Kill switch: window.__clientTtsEnabled = false
-window.__clientTtsEnabled = true;
-let clientTts = null;
-
 /** @type {MediaStream | null} */
 let micStream = null;
 /** @type {AudioContext | null} */
 let micCtx = null;
-/** @type {AudioWorkletNode | ScriptProcessorNode | null} */
+/** @type {ScriptProcessorNode | null} */
 let micProcessor = null;
-let micSourceNode = null;
-let micUsingWorklet = false;
 
-// Time-based VAD config (24 kHz, 20 ms frames via AudioWorklet)
-const VAD_SAMPLE_RATE = 24000;
-const VAD_FRAME_SAMPLES = 480; // 20 ms
-const VAD_FRAME_MS = (VAD_FRAME_SAMPLES / VAD_SAMPLE_RATE) * 1000; // 20
-
+// Voice activity detection (energy-based, tuned for 24 kHz / 4096-sample frames)
 const VAD = {
   speechThreshold: 0.012,
-  // Time-based onset/endpoint (replaces frame counts)
-  onsetMs: 60,            // speech-on confirmation
-  endpointMs: 200,        // end-of-speech hangover
-  // Echo guard for barge-in during TTS
-  bargeInThresholdMult: 1.5,
-  bargeInOnsetMs: 90,
-  // Post-TTS echo tail: keep high threshold for this long after turn ends
-  echoTailMs: 300,
-  // Adaptive noise floor
-  noiseFloorAlpha: 0.02,  // EMA smoothing for noise estimate
-  noiseFloorMult: 3.0,    // speech threshold = max(fixed, noiseFloor * mult)
+  minSpeechFrames: 2,
+  // 2 frames × 4096 @ 24 kHz ≈ 341 ms end-of-speech wait (was 4 ≈ 683 ms).
+  silenceFrames: 2,
+  // Echo guard: while the assistant is speaking (conversationBusy), require a
+  // stronger and longer signal to barge in, so speaker bleed of the bot's own
+  // voice doesn't self-trigger an interrupt loop.
+  bargeInThresholdMult: 2.5,
+  bargeInMinSpeechFrames: 5,
+  // Echo tail: after TTS finishes, keep the high threshold for this many ms
+  // to let buffered audio drain from speakers before lowering the VAD gate.
+  echoTailMs: 800,
 };
-
-// Runtime tuning: call window.__vadTune({ bargeInThresholdMult: 1.4 }) from the
-// browser console during a live call. Changes take effect on the next frame.
-window.__vadTune = (overrides) => {
-  Object.assign(VAD, overrides);
-  console.log("[VAD] tuned:", JSON.stringify(VAD));
-};
-
-// VAD state (time-based accumulators in ms)
-let vadSpeechMs = 0;
-let vadSilenceMs = 0;
-let vadNoiseFloor = 0.005; // running noise estimate
-let vadEchoTailEnd = 0;   // performance.now() when echo tail expires
-
-// Pre-roll ring buffer: ~200 ms of recent PCM for onset preservation
-const PREROLL_FRAMES = Math.ceil(200 / VAD_FRAME_MS); // ~10 frames
-let prerollBuf = [];  // circular array of ArrayBuffer (PCM16)
-
-// Continuation merge: if the caller resumes within this window after an endpoint,
-// abort the pending assistant turn and merge the fragments into one utterance.
-const CONTINUATION_WINDOW_MS = 800;
-let _continuationTimer = null;
-let _continuationText = "";  // stashed transcript from the interrupted segment
-
-// -- Latency metrics -----------------------------------------------------------
-const latencyLog = []; // Array of {endpoint_ms, stt_ms, total_ms, empty, clipped}
-let _lastVoiceTime = 0;   // performance.now() of last loud frame
-let _stopSttTime = 0;     // performance.now() when stop_stt sent
-let _startSttTime = 0;    // performance.now() when start_stt sent (utterance begin)
-let _utteranceHadPreroll = false;
-
-function recordLatencyMetric(text, aborted) {
-  const now = performance.now();
-  const endpointMs = _lastVoiceTime > 0 ? _stopSttTime - _lastVoiceTime : 0;
-  const sttMs = _stopSttTime > 0 ? now - _stopSttTime : 0;
-  const totalMs = _lastVoiceTime > 0 ? now - _lastVoiceTime : 0;
-  const empty = !text || !text.trim();
-  const entry = {
-    ts: Date.now(),
-    endpoint_ms: Math.round(endpointMs),
-    stt_ms: Math.round(sttMs),
-    total_ms: Math.round(totalMs),
-    empty,
-    aborted: !!aborted,
-    had_preroll: _utteranceHadPreroll,
-  };
-  latencyLog.push(entry);
-  if (latencyLog.length > 200) latencyLog.shift();
-
-  const label = empty ? (aborted ? "ABORTED" : "EMPTY") : "OK";
-  console.log(
-    `[VAD-metrics] ${label} | endpoint=${entry.endpoint_ms}ms stt=${entry.stt_ms}ms total=${entry.total_ms}ms preroll=${entry.had_preroll}`
-  );
-
-  // Expose for benchmarking: window.__vadMetrics
-  if (!window.__vadMetrics) window.__vadMetrics = latencyLog;
-}
-
-function getLatencySummary() {
-  const valid = latencyLog.filter((e) => !e.aborted && !e.empty);
-  const all = latencyLog;
-  if (valid.length === 0) return { turns: 0 };
-  const sorted = (arr, key) => arr.map((e) => e[key]).sort((a, b) => a - b);
-  const p = (arr, pct) => arr[Math.min(Math.floor(arr.length * pct), arr.length - 1)];
-  const ep = sorted(valid, "endpoint_ms");
-  const stt = sorted(valid, "stt_ms");
-  const tot = sorted(valid, "total_ms");
-  return {
-    turns: all.length,
-    valid_turns: valid.length,
-    empty_rate: ((all.filter((e) => e.empty).length / all.length) * 100).toFixed(1) + "%",
-    aborted_rate: ((all.filter((e) => e.aborted).length / all.length) * 100).toFixed(1) + "%",
-    endpoint_p50: p(ep, 0.5),
-    endpoint_p95: p(ep, 0.95),
-    stt_p50: p(stt, 0.5),
-    stt_p95: p(stt, 0.95),
-    total_p50: p(tot, 0.5),
-    total_p95: p(tot, 0.95),
-  };
-}
-// Expose summary for console benchmarking
-window.__vadSummary = getLatencySummary;
+let vadSpeechFrames = 0;
+let vadSilenceFrames = 0;
+let echoTailUntil = 0;
 
 let currentAssistantEl = null;
 let currentAssistantText = "";
@@ -244,8 +153,6 @@ function sendJSON(obj) {
 }
 
 function sendConfig() {
-  // When client-side TTS is active, tell server to skip its TTS pipeline
-  const useClientTts = window.__clientTtsEnabled && ttsToggle.checked;
   sendJSON({
     type: "config",
     model: modelSelect.value,
@@ -253,7 +160,7 @@ function sendConfig() {
     voice_id: voiceSelect.value,
     instruction_set: instructSelect.value,
     context: contextSelect.value,
-    tts_enabled: useClientTts ? false : ttsToggle.checked,
+    tts_enabled: ttsToggle.checked,
     language: "English",
   });
 }
@@ -299,7 +206,6 @@ function handleServerEvent(evt) {
       if (inUtterance && !sttFinishing) {
         sttFinishing = true;
         inUtterance = false;
-        _stopSttTime = performance.now();
         sttStatus.textContent = "Processing…";
         sendJSON({ type: "stop_stt" });
         btnMic.classList.remove("recording");
@@ -323,39 +229,16 @@ function handleServerEvent(evt) {
       break;
 
     case "transcript_done":
-      // Continuation merge: stash the interrupted segment's transcript
-      if (_continuationText === "__pending__") {
-        _continuationText = evt.text || "";
-        // Remove the partial bubble for this stashed segment
-        if (sttPartialBubble) {
-          sttPartialBubble.remove();
-          sttPartialBubble = null;
-        }
-        sttPartialText = "";
-        sttStatus.textContent = "Listening…";
-        console.log("[VAD] stashed continuation text:", _continuationText);
-        break;
+      if (sttPartialBubble) {
+        sttPartialBubble.classList.remove("message-streaming");
+        const textSpan = sttPartialBubble.querySelector(".message-text");
+        if (textSpan) textSpan.textContent = evt.text;
+        sttPartialBubble = null;
+      } else {
+        appendMessage("user", evt.text);
       }
-
-      {
-        let finalText = evt.text || "";
-        if (_continuationText) {
-          finalText = _continuationText.trimEnd() + " " + finalText.trimStart();
-          console.log("[VAD] merged continuation:", finalText);
-          _continuationText = "";
-        }
-        if (sttPartialBubble) {
-          sttPartialBubble.classList.remove("message-streaming");
-          const textSpan = sttPartialBubble.querySelector(".message-text");
-          if (textSpan) textSpan.textContent = finalText;
-          sttPartialBubble = null;
-        } else {
-          appendMessage("user", finalText);
-        }
-        sttPartialText = "";
-        sttStatus.textContent = "";
-        recordLatencyMetric(finalText, false);
-      }
+      sttPartialText = "";
+      sttStatus.textContent = "";
       break;
 
     case "stt_stopped":
@@ -366,13 +249,10 @@ function handleServerEvent(evt) {
         const textSpan = sttPartialBubble.querySelector(".message-text");
         if (textSpan && !textSpan.textContent.trim()) {
           sttPartialBubble.remove();
-          recordLatencyMetric("", true);
         } else if (sttPartialBubble) {
           sttPartialBubble.classList.remove("message-streaming");
         }
         sttPartialBubble = null;
-      } else {
-        recordLatencyMetric("", true);
       }
       btnMic.classList.remove("recording");
       updateListenStatus();
@@ -385,7 +265,6 @@ function handleServerEvent(evt) {
       currentAssistantText = "";
       currentAssistantEl = appendMessage("assistant", "", true);
       stopTtsPlayback();
-      if (clientTts) clientTts.reset();
       break;
 
     case "excuse_me_start":
@@ -410,16 +289,10 @@ function handleServerEvent(evt) {
         currentAssistantEl.querySelector(".message-text").textContent = currentAssistantText;
         scrollToBottom();
       }
-      if (clientTts?.enabled && ttsToggle.checked) {
-        clientTts.feed(evt.delta);
-      }
       break;
 
     case "llm_done":
       llmStatus.textContent = "";
-      if (clientTts?.enabled && ttsToggle.checked) {
-        clientTts.flush();
-      }
       if (currentAssistantEl) {
         currentAssistantEl.classList.remove("message-streaming");
         const meta = currentAssistantEl.querySelector(".message-meta");
@@ -440,14 +313,10 @@ function handleServerEvent(evt) {
       break;
 
     case "turn_done":
-      // If client-side TTS is still streaming, don't clear conversationBusy yet
-      // (onTtsDone callback will handle it)
-      if (!clientTts?.active) {
-        conversationBusy = false;
-        vadEchoTailEnd = performance.now() + VAD.echoTailMs;
-        updateExcuseMeButton();
-        updateListenStatus();
-      }
+      conversationBusy = false;
+      echoTailUntil = Date.now() + VAD.echoTailMs;
+      updateExcuseMeButton();
+      updateListenStatus();
       break;
 
     case "history_cleared":
@@ -689,32 +558,12 @@ async function ensureTtsPlayer() {
     ttsPlayer = new AudioStreamPlayer();
   }
   await ttsPlayer.init(24000);
-
-  if (!clientTts) {
-    clientTts = new ClientTTS({
-      ttsPort: parseInt(location.port) === 8020 ? 25568 : 25568,
-      getAudioPlayer: () => ttsPlayer,
-      getVoiceId: () => voiceSelect?.value || "mikey",
-      getLanguage: () => "English",
-    });
-    clientTts.onTtsStart = () => { conversationBusy = true; updateExcuseMeButton(); };
-    clientTts.onTtsDone = () => {
-      conversationBusy = false;
-      vadEchoTailEnd = performance.now() + VAD.echoTailMs;
-      updateExcuseMeButton();
-      updateListenStatus();
-    };
-  }
-
   return ttsPlayer;
 }
 
 function stopTtsPlayback() {
   if (ttsPlayer) {
     ttsPlayer.stopPlayback();
-  }
-  if (clientTts) {
-    clientTts.cancel();
   }
 }
 
@@ -751,91 +600,6 @@ function float32ToPcm16Buffer(float32) {
     pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
   return pcm16.buffer;
-}
-
-/**
- * Get effective speech threshold — adaptive noise floor or fixed,
- * whichever is higher, with barge-in multiplier when echo tail is active.
- */
-function getVadThreshold() {
-  const now = performance.now();
-  const echoActive = conversationBusy || now < vadEchoTailEnd;
-  const baseThreshold = Math.max(
-    VAD.speechThreshold,
-    vadNoiseFloor * VAD.noiseFloorMult
-  );
-  return echoActive ? baseThreshold * VAD.bargeInThresholdMult : baseThreshold;
-}
-
-function getVadOnsetMs() {
-  const now = performance.now();
-  const echoActive = conversationBusy || now < vadEchoTailEnd;
-  return echoActive ? VAD.bargeInOnsetMs : VAD.onsetMs;
-}
-
-/**
- * Process a VAD frame. Called with { rms, pcm } from worklet or
- * with computed values from ScriptProcessor fallback.
- * @param {number} rms - RMS energy of the frame
- * @param {ArrayBuffer} pcmBuf - PCM16 ArrayBuffer for this frame
- */
-function processVadFrame(rms, pcmBuf) {
-  if (!listenMode) return;
-
-  // Update adaptive noise floor during silence (EMA)
-  if (!inUtterance) {
-    const threshold = getVadThreshold();
-    if (rms < threshold) {
-      vadNoiseFloor += VAD.noiseFloorAlpha * (rms - vadNoiseFloor);
-    }
-  }
-
-  // Pre-roll: always keep last ~200 ms of PCM in ring buffer
-  prerollBuf.push(pcmBuf);
-  if (prerollBuf.length > PREROLL_FRAMES) {
-    prerollBuf.shift();
-  }
-
-  const threshold = getVadThreshold();
-  const loud = rms >= threshold;
-
-  if (!inUtterance) {
-    if (loud) {
-      vadSpeechMs += VAD_FRAME_MS;
-      if (vadSpeechMs >= getVadOnsetMs()) {
-        beginUtterance();
-        // Send pre-roll buffer so onset phonemes aren't lost
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          for (const buf of prerollBuf) {
-            ws.send(buf);
-          }
-        }
-        prerollBuf = [];
-      }
-    } else {
-      // Decay rather than hard-reset: speech oscillating around a raised
-      // barge-in threshold must still accumulate enough onset to trigger.
-      vadSpeechMs = Math.max(0, vadSpeechMs - VAD_FRAME_MS);
-    }
-    return;
-  }
-
-  // In utterance — send PCM to server
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(pcmBuf);
-  }
-
-  if (loud) {
-    vadSilenceMs = 0;
-    _lastVoiceTime = performance.now();
-  } else {
-    vadSilenceMs += VAD_FRAME_MS;
-    if (vadSilenceMs >= VAD.endpointMs) {
-      endUtterance();
-      vadSpeechMs = 0;
-      vadSilenceMs = 0;
-    }
-  }
 }
 
 function updateExcuseMeButton(highlight = false) {
@@ -879,7 +643,7 @@ function onExcuseMeStart(evt) {
 function onTurnCancelled() {
   stopTtsPlayback();
   conversationBusy = false;
-  vadEchoTailEnd = performance.now() + VAD.echoTailMs;
+  echoTailUntil = Date.now() + VAD.echoTailMs;
   updateExcuseMeButton();
   llmStatus.textContent = "";
   if (currentAssistantEl) {
@@ -920,31 +684,18 @@ function updateListenStatus() {
 }
 
 function beginUtterance() {
-  if (inUtterance || !listenMode) return;
+  if (inUtterance || sttFinishing || !listenMode) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-  // Continuation merge: caller resumed within the window after an endpoint.
-  // Cancel the pending turn and stash whatever transcript arrives from it.
-  const isContinuation = _continuationTimer !== null;
-  if (isContinuation) {
-    clearTimeout(_continuationTimer);
-    _continuationTimer = null;
-    // Mark that the next transcript_done should be stashed, not acted on
-    _continuationText = "__pending__";
-    sendJSON({ type: "interrupt" });
-    console.log("[VAD] continuation detected — merging with previous segment");
-  } else if (conversationBusy) {
+  if (conversationBusy) {
     stopTtsPlayback();
+    // Explicit interrupt: with non-blocking turns the server processes this
+    // immediately, cancelling LLM/TTS before the start_stt below.
     sendJSON({ type: "interrupt" });
   }
-
   inUtterance = true;
   sttFinishing = false;
-  vadSpeechMs = 0;
-  vadSilenceMs = 0;
-  _startSttTime = performance.now();
-  _lastVoiceTime = performance.now();
-  _utteranceHadPreroll = prerollBuf.length > 0;
+  vadSpeechFrames = 0;
+  vadSilenceFrames = 0;
   sendJSON({ type: "start_stt" });
   btnMic.classList.add("recording");
   updateListenStatus();
@@ -954,19 +705,54 @@ function endUtterance() {
   if (!inUtterance || sttFinishing) return;
   sttFinishing = true;
   inUtterance = false;
-  _stopSttTime = performance.now();
   sttStatus.textContent = "Transcribing…";
   sendJSON({ type: "stop_stt" });
+}
 
-  // Open a continuation window: if the caller resumes quickly, the pending
-  // turn gets cancelled and fragments are merged into one utterance.
-  if (_continuationTimer) clearTimeout(_continuationTimer);
-  _continuationTimer = setTimeout(() => { _continuationTimer = null; }, CONTINUATION_WINDOW_MS);
+function processVad(float32) {
+  if (!listenMode) return;
+
+  // Echo guard: use high threshold while assistant is speaking OR during
+  // the echo tail period after TTS finishes (audio still draining from speakers).
+  const bargeIn = conversationBusy || Date.now() < echoTailUntil;
+  const threshold = bargeIn
+    ? VAD.speechThreshold * VAD.bargeInThresholdMult
+    : VAD.speechThreshold;
+  const minFrames = bargeIn ? VAD.bargeInMinSpeechFrames : VAD.minSpeechFrames;
+  const loud = pcmRms(float32) >= threshold;
+
+  if (!inUtterance) {
+    if (loud) {
+      vadSpeechFrames += 1;
+      if (vadSpeechFrames >= minFrames) {
+        beginUtterance();
+      }
+    } else {
+      vadSpeechFrames = 0;
+    }
+    return;
+  }
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(float32ToPcm16Buffer(float32));
+  }
+
+  if (loud) {
+    vadSilenceFrames = 0;
+  } else {
+    vadSilenceFrames += 1;
+    if (vadSilenceFrames >= VAD.silenceFrames) {
+      endUtterance();
+      vadSpeechFrames = 0;
+      vadSilenceFrames = 0;
+    }
+  }
 }
 
 async function enableListenMode() {
   if (listenMode) return;
 
+  // TTS player init must not block mic capture (and can leave AudioContext suspended).
   try {
     await ensureTtsPlayer();
   } catch (err) {
@@ -996,63 +782,33 @@ async function enableListenMode() {
   }
 
   micCtx = new AudioContext({ sampleRate: 24000 });
+  // Browsers often start AudioContext suspended until a user gesture / resume().
   if (micCtx.state === "suspended") {
-    try { await micCtx.resume(); } catch (err) {
+    try {
+      await micCtx.resume();
+    } catch (err) {
       console.warn("AudioContext resume failed:", err);
     }
   }
 
-  micSourceNode = micCtx.createMediaStreamSource(micStream);
-  micUsingWorklet = false;
-
-  // Try AudioWorklet (low-latency 20 ms frames)
-  try {
-    await micCtx.audioWorklet.addModule("js/vad-processor.js?v=20260805a");
-    const workletNode = new AudioWorkletNode(micCtx, "vad-processor", {
-      processorOptions: { frameSamples: VAD_FRAME_SAMPLES },
-    });
-    workletNode.port.onmessage = (e) => {
-      if (e.data.type === "vad") {
-        processVadFrame(e.data.rms, e.data.pcm);
-      }
-    };
-    micSourceNode.connect(workletNode);
-    // Worklet still needs a destination connection to keep the graph alive
-    const silent = micCtx.createGain();
-    silent.gain.value = 0;
-    workletNode.connect(silent);
-    silent.connect(micCtx.destination);
-    micProcessor = workletNode;
-    micUsingWorklet = true;
-    console.log("VAD: using AudioWorklet (20 ms frames)");
-  } catch (err) {
-    console.warn("AudioWorklet unavailable, falling back to ScriptProcessor:", err);
-    // Fallback: ScriptProcessor with smaller buffer (2048 samples = ~85 ms)
-    const sp = micCtx.createScriptProcessor(2048, 1, 1);
-    sp.onaudioprocess = (e) => {
-      if (!listenMode) return;
-      const float32 = e.inputBuffer.getChannelData(0);
-      // Process in VAD_FRAME_SAMPLES chunks to match worklet behavior
-      for (let off = 0; off + VAD_FRAME_SAMPLES <= float32.length; off += VAD_FRAME_SAMPLES) {
-        const chunk = float32.subarray(off, off + VAD_FRAME_SAMPLES);
-        const rms = pcmRms(chunk);
-        const pcmBuf = float32ToPcm16Buffer(chunk);
-        processVadFrame(rms, pcmBuf);
-      }
-    };
-    micSourceNode.connect(sp);
-    const silent = micCtx.createGain();
-    silent.gain.value = 0;
-    sp.connect(silent);
-    silent.connect(micCtx.destination);
-    micProcessor = sp;
-  }
+  const source = micCtx.createMediaStreamSource(micStream);
+  micProcessor = micCtx.createScriptProcessor(4096, 1, 1);
+  micProcessor.onaudioprocess = (e) => {
+    if (!listenMode) return;
+    processVad(e.inputBuffer.getChannelData(0));
+  };
+  source.connect(micProcessor);
+  // Do NOT connect the mic graph to destination. That plays the mic into the
+  // speakers and echoCancellation then nulls the capture — mic looks "dead".
+  const silent = micCtx.createGain();
+  silent.gain.value = 0;
+  micProcessor.connect(silent);
+  silent.connect(micCtx.destination);
 
   listenMode = true;
   inUtterance = false;
-  vadSpeechMs = 0;
-  vadSilenceMs = 0;
-  prerollBuf = [];
+  vadSpeechFrames = 0;
+  vadSilenceFrames = 0;
   btnMic.classList.add("listening");
   btnMic.classList.remove("recording");
   updateListenStatus();
@@ -1065,23 +821,14 @@ function disableListenMode() {
   }
   listenMode = false;
   inUtterance = false;
-  vadSpeechMs = 0;
-  vadSilenceMs = 0;
-  prerollBuf = [];
-  if (_continuationTimer) { clearTimeout(_continuationTimer); _continuationTimer = null; }
-  _continuationText = "";
+  vadSpeechFrames = 0;
+  vadSilenceFrames = 0;
   btnMic.classList.remove("listening", "recording");
 
   if (micProcessor) {
     micProcessor.disconnect();
-    if (!micUsingWorklet && micProcessor.onaudioprocess !== undefined) {
-      micProcessor.onaudioprocess = null;
-    }
+    micProcessor.onaudioprocess = null;
     micProcessor = null;
-  }
-  if (micSourceNode) {
-    micSourceNode.disconnect();
-    micSourceNode = null;
   }
   if (micCtx) {
     micCtx.close().catch(() => {});
@@ -1091,7 +838,6 @@ function disableListenMode() {
     micStream.getTracks().forEach((t) => t.stop());
     micStream = null;
   }
-  micUsingWorklet = false;
   sttStatus.textContent = "";
 }
 

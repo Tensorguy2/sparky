@@ -1,81 +1,23 @@
 """
 Multi-provider LLM service.
 
-Routes generation requests to OpenAI, Anthropic, or a local GPU-served model
-based on the requested model, yielding streamed text tokens as an async
-generator.
+Routes generation requests to OpenAI or Anthropic based on the requested
+model, yielding streamed text tokens as an async generator.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
 from typing import AsyncGenerator, List, Optional
 
 import anthropic
-import httpx
 import openai
 
 import config
 from models.instructions import ModelParams
-from services import local_llm
 
 logger = logging.getLogger(__name__)
-
-# Both SDKs default to httpx's 5 s keepalive_expiry, which is shorter than a
-# normal pause between voice turns -- so the pool drops the connection and the
-# next turn pays a fresh DNS+TCP+TLS handshake (~79 ms to OpenAI, ~58 ms to
-# Anthropic). Holding connections open across a turn boundary removes that.
-# Set LLM_KEEPALIVE_SECONDS=5 to restore the stock behaviour.
-_KEEPALIVE_SECONDS = float(os.getenv("LLM_KEEPALIVE_SECONDS", "300"))
-
-# Anthropic prompt caching: the system prompt (~5k tokens of persona + context)
-# is identical across the turns of a call. Marking it cacheable lets the API
-# skip its prefill on every turn after the first (5-minute TTL, refreshed on
-# each use, so it stays warm for the whole call). Kill switch below.
-_PROMPT_CACHE = os.getenv("LLM_PROMPT_CACHE", "true").lower() in ("1", "true", "yes")
-
-
-def _anthropic_system(system_prompt: str):
-    """System prompt in cacheable block form (or plain string when disabled)."""
-    if not _PROMPT_CACHE or not system_prompt:
-        return system_prompt
-    return [{
-        "type": "text",
-        "text": system_prompt,
-        "cache_control": {"type": "ephemeral"},
-    }]
-
-
-def _http_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        limits=httpx.Limits(
-            max_connections=1000,
-            max_keepalive_connections=100,
-            keepalive_expiry=_KEEPALIVE_SECONDS,
-        ),
-        timeout=httpx.Timeout(connect=5.0, read=600.0, write=600.0, pool=600.0),
-    )
-
-
-def _register_local_models() -> None:
-    """Add the local provider to the shared model registry.
-
-    config.provider_for_model walks AVAILABLE_MODELS, and the client builds its
-    dropdown optgroups from the same dict, so this one insertion covers both
-    routing and the UI.
-    """
-    ids = local_llm.available_model_ids()
-    if not ids:
-        config.AVAILABLE_MODELS.pop(local_llm.PROVIDER, None)
-        return
-    config.AVAILABLE_MODELS[local_llm.PROVIDER] = ids
-    logger.info("Registered local models: %s", ", ".join(ids))
-
-
-_register_local_models()
 
 _openai_client: openai.AsyncOpenAI | None = None
 _anthropic_client: anthropic.AsyncAnthropic | None = None
@@ -84,76 +26,15 @@ _anthropic_client: anthropic.AsyncAnthropic | None = None
 def _get_openai() -> openai.AsyncOpenAI:
     global _openai_client
     if _openai_client is None:
-        _openai_client = openai.AsyncOpenAI(
-            api_key=config.OPENAI_API_KEY,
-            http_client=_http_client(),
-        )
+        _openai_client = openai.AsyncOpenAI(api_key=config.OPENAI_API_KEY)
     return _openai_client
 
 
 def _get_anthropic() -> anthropic.AsyncAnthropic:
     global _anthropic_client
     if _anthropic_client is None:
-        _anthropic_client = anthropic.AsyncAnthropic(
-            api_key=config.ANTHROPIC_API_KEY,
-            http_client=_http_client(),
-        )
+        _anthropic_client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
     return _anthropic_client
-
-
-async def prewarm(model: str | None = None) -> None:
-    """Open the TLS connection before the first turn needs it.
-
-    Without this the first user of the session pays the full handshake; the
-    keepalive setting only helps from the second turn onward.
-    """
-    target = model or config.DEFAULT_MODEL
-    try:
-        provider = config.provider_for_model(target)
-    except Exception:
-        return
-    try:
-        if provider == "openai":
-            await _get_openai().models.list()
-        elif provider == "anthropic":
-            await _get_anthropic().models.list()
-    except Exception as e:
-        logger.debug("prewarm skipped (%s): %s", provider, e)
-
-
-# Streaming responses never return their connection to the pool: the SSE body
-# stops at "[DONE]" without being drained to EOF, so httpx closes it. A
-# streaming request will happily *consume* an already-idle pooled connection
-# though, so refilling the pool after each turn is what actually removes the
-# handshake from the next turn's critical path. The refill runs while the
-# assistant is still speaking, where the latency is free.
-_REWARM = os.getenv("LLM_REWARM_CONNECTION", "true").lower() in ("1", "true", "yes")
-
-# Tasks are kept referenced until they finish; a bare create_task can be
-# garbage-collected mid-flight and logged as "Task was destroyed but it is
-# pending".
-_rewarm_tasks: set[asyncio.Task] = set()
-
-
-def _schedule_rewarm(provider: str) -> None:
-    if not _REWARM:
-        return
-    try:
-        task = asyncio.create_task(_rewarm(provider))
-    except RuntimeError:
-        return  # no running loop (shutdown)
-    _rewarm_tasks.add(task)
-    task.add_done_callback(_rewarm_tasks.discard)
-
-
-async def _rewarm(provider: str) -> None:
-    try:
-        if provider == "openai":
-            await _get_openai().models.list()
-        elif provider == "anthropic":
-            await _get_anthropic().models.list()
-    except Exception as e:
-        logger.debug("connection rewarm failed (%s): %s", provider, e)
 
 
 def _openai_uses_max_completion_tokens(model: str) -> bool:
@@ -174,22 +55,8 @@ def _openai_supports_temperature(model: str) -> bool:
     return True
 
 
-# Anthropic returns a hard 400 ("`temperature` is deprecated for this model")
-# rather than ignoring the field, and the set of affected models grows with each
-# release -- Sonnet 5 and Fable 5 reject it as well, not just Opus. Rather than
-# chase that list, the first rejection for a model is remembered here and the
-# call is retried without temperature.
-_anthropic_no_temperature: set[str] = set()
-
-
-def _is_temperature_deprecated_error(exc: Exception) -> bool:
-    return "temperature" in str(exc).lower() and "deprecat" in str(exc).lower()
-
-
 def _anthropic_supports_temperature(model: str) -> bool:
     """Opus 4.7+ deprecates the temperature parameter."""
-    if model in _anthropic_no_temperature:
-        return False
     m = model.lower()
     if "opus" in m:
         return False
@@ -222,9 +89,6 @@ async def stream_chat(
             yield token
     elif provider == "anthropic":
         async for token in _stream_anthropic(model, system_prompt, messages, p):
-            yield token
-    elif provider == local_llm.PROVIDER:
-        async for token in local_llm.stream_chat(model, system_prompt, messages, p):
             yield token
     else:
         raise ValueError(f"Unsupported provider: {provider}")
@@ -264,14 +128,10 @@ async def _stream_openai(
 
     stream = await client.chat.completions.create(**create_kwargs)
 
-    try:
-        async for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if delta and delta.content:
-                yield delta.content
-    finally:
-        # Also covers barge-in, where the generator is closed early.
-        _schedule_rewarm("openai")
+    async for chunk in stream:
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if delta and delta.content:
+            yield delta.content
 
 
 async def call_tool(
@@ -298,11 +158,6 @@ async def call_tool(
         )
     elif provider == "anthropic":
         return await _call_tool_anthropic(
-            model, system_prompt, messages,
-            tool_name, tool_description, parameters, max_tokens,
-        )
-    elif provider == local_llm.PROVIDER:
-        return await local_llm.call_tool(
             model, system_prompt, messages,
             tool_name, tool_description, parameters, max_tokens,
         )
@@ -362,7 +217,7 @@ async def _call_tool_anthropic(
     client = _get_anthropic()
     resp = await client.messages.create(
         model=model,
-        system=_anthropic_system(system_prompt),
+        system=system_prompt,
         messages=messages,
         max_tokens=max_tokens,
         tools=[{
@@ -395,26 +250,13 @@ async def _stream_anthropic(
 
     create_kwargs: dict = {
         "model": model,
-        "system": _anthropic_system(system_prompt),
+        "system": system_prompt,
         "messages": messages,
         "max_tokens": params.max_tokens,
     }
     if _anthropic_supports_temperature(model):
         create_kwargs["temperature"] = params.temperature
 
-    try:
-        try:
-            async with client.messages.stream(**create_kwargs) as stream:
-                async for text in stream.text_stream:
-                    yield text
-        except anthropic.BadRequestError as e:
-            if not (create_kwargs.pop("temperature", None) is not None
-                    and _is_temperature_deprecated_error(e)):
-                raise
-            _anthropic_no_temperature.add(model)
-            logger.info("Anthropic: %s rejects temperature; retrying without it", model)
-            async with client.messages.stream(**create_kwargs) as stream:
-                async for text in stream.text_stream:
-                    yield text
-    finally:
-        _schedule_rewarm("anthropic")
+    async with client.messages.stream(**create_kwargs) as stream:
+        async for text in stream.text_stream:
+            yield text

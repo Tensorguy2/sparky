@@ -10,8 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
-import uuid
 from dataclasses import dataclass
 from typing import AsyncGenerator, Optional, Union
 
@@ -22,48 +20,6 @@ import config
 logger = logging.getLogger(__name__)
 
 EXCUSE_ME_PHRASE = "Excuse me."
-
-# Turn grouping for the TTS server's speaker lock.
-#
-# Each sentence of a reply is synthesized by its own call here, and the server
-# needs to know which calls belong together so it can hold them all to the
-# speaker the first one rendered -- otherwise every sentence re-rolls the voice
-# and the caller hears it change mid-reply.
-#
-# The caller cannot supply an id (it lives in server.py, which now only exists
-# as compiled bytecode), but the dispatch pattern makes it inferable: sentences
-# of one reply are issued back-to-back, ~1-2 ms apart, while consecutive turns
-# are separated by however long the caller speaks -- never observed below 2 s.
-# Anything arriving within the gap below continues the current turn.
-_TURN_GAP_S = 8.0
-
-# voice_id -> (last activity, turn id)
-_turns: dict[str, tuple[float, str]] = {}
-
-
-def _turn_id_for(voice_id: str) -> str:
-    now = time.monotonic()
-    last = _turns.get(voice_id)
-    if last is not None and now - last[0] < _TURN_GAP_S:
-        turn = last[1]
-    else:
-        turn = uuid.uuid4().hex[:12]
-    _turns[voice_id] = (now, turn)
-    if len(_turns) > 32:
-        for k in sorted(_turns, key=lambda k: _turns[k][0])[:16]:
-            _turns.pop(k, None)
-    return turn
-
-
-def _touch_turn(voice_id: str) -> None:
-    """Extend the turn window past the end of this synthesis.
-
-    Measured from the end rather than the start, since the next sentence is
-    dispatched as soon as this one finishes streaming.
-    """
-    last = _turns.get(voice_id)
-    if last is not None:
-        _turns[voice_id] = (time.monotonic(), last[1])
 
 
 @dataclass
@@ -116,11 +72,10 @@ async def stream_tts(
     """
     voice_id = voice_id or config.DEFAULT_VOICE_ID
     url = config.TTS_WS_URL
-    turn_id = _turn_id_for(voice_id)
 
     logger.info(
-        "TTS request | voice=%s lang=%s text_len=%d turn=%s url=%s",
-        voice_id, language, len(text), turn_id, url,
+        "TTS request | voice=%s lang=%s text_len=%d url=%s",
+        voice_id, language, len(text), url,
     )
 
     try:
@@ -129,7 +84,6 @@ async def stream_tts(
                 "text": text,
                 "language": language,
                 "voice_id": voice_id,
-                "turn_id": turn_id,
             }))
 
             sample_rate = 24000
@@ -186,8 +140,6 @@ async def stream_tts(
         logger.error("Cannot connect to TTS server at %s", url)
     except Exception:
         logger.exception("TTS client error.")
-    finally:
-        _touch_turn(voice_id)
 
 
 async def fetch_voices() -> list[dict]:

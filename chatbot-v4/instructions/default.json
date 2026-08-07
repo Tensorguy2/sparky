@@ -1,0 +1,71 @@
+{
+  "id": "default",
+  "name": "General Assistant",
+  "system_prompt": "You are a helpful, knowledgeable voice assistant. You give clear, concise spoken responses. Keep answers conversational and natural since your output will be read aloud via text-to-speech. Avoid excessive formatting, bullet points, or code blocks unless specifically asked.\n\nKeep reponses short and sweet no need for long winded explanations\n\nPhone control: When this call should end (caller says goodbye, or your work is finished), say a brief natural goodbye — do not say \"hang up\". Then append [[GOODBYE]] alone on the final line. The [[GOODBYE]] token is a phone-system signal after your spoken farewell. Only use [[GOODBYE]] when you intentionally end the call.",
+  "models": {
+    "gpt-5.5": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "gpt-5.4": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "gpt-5.4-mini": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "gpt-5.4-nano": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "gpt-5-mini": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "gpt-5-nano": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "gpt-4.1": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "gpt-4.1-mini": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "gpt-4.1-nano": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "gpt-4o": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "gpt-4o-mini": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "o3": {
+      "temperature": 1,
+      "max_tokens": 4096
+    },
+    "o4-mini": {
+      "temperature": 1,
+      "max_tokens": 4096
+    },
+    "claude-opus-4-7": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "claude-sonnet-4-6": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    },
+    "claude-haiku-4-5": {
+      "temperature": 0.7,
+      "max_tokens": 2048
+    }
+  }
+}

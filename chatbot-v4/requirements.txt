@@ -1,0 +1,11 @@
+fastapi>=0.135.0
+uvicorn>=0.44.0
+websockets>=12.0
+python-dotenv>=1.0.0
+openai>=1.40.0
+anthropic>=0.30.0
+tiktoken>=0.7.0
+faster-whisper>=1.0.0
+onnx-asr[cpu,hub]>=0.12.0
+torch>=2.0.0
+torchaudio>=2.0.0
