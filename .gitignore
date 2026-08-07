@@ -66,3 +66,8 @@ chatbot-v3/data/sessions/
 
 # Runtime call contexts (v4)
 chatbot-v4/context/call-*.md
+
+# Backups / rotated logs
+qwen-bak.zip
+src/logs/
+*.log.*
