@@ -222,11 +222,12 @@ class ChatSession:
             parts.append(iset)
         return "\n\n".join(parts) if parts else ""
 
-    def get_model_params(self) -> Optional[ModelParams]:
-        iset = instruction_mgr.get(self.instruction_set_id) if instruction_mgr and self.instruction_set_id else None
-        if iset and hasattr(iset, "params"):
-            return iset.params
-        return None
+    def get_model_params(self) -> ModelParams:
+        if instruction_mgr:
+            iset = instruction_mgr.get(self.instruction_set_id) if self.instruction_set_id else None
+            if iset:
+                return iset.params_for(self.model)
+        return ModelParams()
 
 
 # ---------------------------------------------------------------------------
@@ -434,39 +435,47 @@ async def get_flow():
 async def list_instructions():
     if not instruction_mgr:
         return []
-    return [{"id": iset.id, "label": getattr(iset, "label", iset.id)} for iset in instruction_mgr.list_all()]
+    return [iset.to_dict() for iset in instruction_mgr.list_all()]
 
 
 @app.get("/api/instructions/{set_id}")
 async def get_instruction_set(set_id: str):
     iset = instruction_mgr.get(set_id) if instruction_mgr else None
     if iset:
-        return iset.__dict__ if hasattr(iset, "__dict__") else {"id": set_id}
+        return iset.to_dict()
     return JSONResponse(status_code=404, content={"error": "not found"})
 
 
 @app.put("/api/instructions/{set_id}")
 async def save_instruction_set(set_id: str, body: dict):
     if not instruction_mgr:
-        return JSONResponse(status_code=500, content={"error": "no instruction manager"})
+        return JSONResponse(status_code=500, content={"error": "not initialized"})
     body_id = body.get("id", set_id)
+    if body_id != set_id:
+        return JSONResponse(status_code=400, content={"error": "id in body must match URL"})
     try:
-        iset = instruction_mgr.save(body_id, body)
-        return iset.__dict__ if hasattr(iset, "__dict__") else {"id": body_id}
-    except Exception as exc:
+        iset = instruction_mgr.save_from_dict(body)
+        return {"status": "saved", "instruction": iset.to_dict()}
+    except (KeyError, ValueError, TypeError) as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        logger.exception("Failed to save instruction set %s", set_id)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
 @app.post("/api/instructions")
 async def create_instruction_set(body: dict):
     if not instruction_mgr:
-        return JSONResponse(status_code=500, content={"error": "no instruction manager"})
-    set_id = body.get("id", uuid.uuid4().hex[:8])
+        return JSONResponse(status_code=500, content={"error": "not initialized"})
+    body.setdefault("id", uuid.uuid4().hex[:8])
     try:
-        iset = instruction_mgr.save(set_id, body)
-        return iset.__dict__ if hasattr(iset, "__dict__") else {"id": set_id}
-    except Exception as exc:
+        iset = instruction_mgr.save_from_dict(body)
+        return {"status": "saved", "instruction": iset.to_dict()}
+    except (KeyError, ValueError, TypeError) as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        logger.exception("Failed to create instruction set")
+        return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
 @app.delete("/api/instructions/{set_id}")
@@ -608,6 +617,7 @@ async def ws_chat(ws: WebSocket):
                                 language=config.STT_LANGUAGE,
                                 on_delta=_on_delta,
                                 on_vad_stopped=_on_vad_stopped,
+                                model=stt_model,
                             )
                             session.stt_stream = stream
                             session._stt_persistent = stream

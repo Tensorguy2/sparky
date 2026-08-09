@@ -17,10 +17,16 @@ logger = logging.getLogger(__name__)
 RealtimeDeltaCallback = Callable[[str], Awaitable[None]]
 
 OPENAI_BATCH_MODELS = frozenset({
+    "gpt-transcribe",  # July 2026 — recommended batch model
     "gpt-4o-transcribe",
     "gpt-4o-mini-transcribe",
     "gpt-4o-mini-transcribe-2025-12-15",
     "whisper-1",
+})
+
+OPENAI_REALTIME_MODELS = frozenset({
+    "gpt-live-transcribe",  # July 2026 — recommended streaming model
+    "gpt-realtime-whisper",
 })
 
 PARAKEET_ENTRY = {
@@ -49,7 +55,7 @@ _ensure_parakeet_listed()
 
 
 def is_realtime_model(model_id: str) -> bool:
-    return model_id == "gpt-realtime-whisper"
+    return model_id in OPENAI_REALTIME_MODELS
 
 
 def is_openai_batch_model(model_id: str) -> bool:
@@ -108,9 +114,11 @@ async def create_realtime_session(
     language: Optional[str] = None,
     on_delta: Optional[RealtimeDeltaCallback] = None,
     on_vad_stopped: Optional[Callable[[], Awaitable[None]]] = None,
+    model: Optional[str] = None,
 ) -> RealtimeTranscriber:
     lang = language or config.STT_LANGUAGE
     session = RealtimeTranscriber(
+        model=model or "gpt-live-transcribe",
         language=lang,
         delay=config.STT_REALTIME_DELAY,
         on_delta=on_delta,

@@ -1,5 +1,9 @@
 """
-OpenAI speech-to-text: streaming (gpt-realtime-whisper) and batch (4o transcribe).
+OpenAI speech-to-text: streaming (gpt-live-transcribe / gpt-realtime-whisper)
+and batch (gpt-transcribe / 4o transcribe).
+
+The July 2026 generation (gpt-transcribe, gpt-live-transcribe) replaces the
+legacy `language` hint with a `languages` array; both generations are handled.
 """
 
 from __future__ import annotations
@@ -23,6 +27,9 @@ logger = logging.getLogger(__name__)
 RealtimeDeltaCallback = Callable[[str], Awaitable[None]]
 
 REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
+
+# July 2026 models: use `languages` (array) instead of the legacy `language`.
+NEW_GEN_MODELS = frozenset({"gpt-transcribe", "gpt-live-transcribe"})
 
 
 def _require_api_key() -> None:
@@ -57,6 +64,7 @@ class RealtimeTranscriber:
 
     def __init__(
         self,
+        model: str = "gpt-live-transcribe",
         language: str = "en",
         delay: str = "low",
         on_delta: Optional[RealtimeDeltaCallback] = None,
@@ -64,6 +72,7 @@ class RealtimeTranscriber:
         server_vad: bool = True,
         vad_silence_ms: int = 500,
     ):
+        self.model = model
         self.language = language
         self.delay = delay
         self.on_delta = on_delta
@@ -72,6 +81,8 @@ class RealtimeTranscriber:
         self.vad_silence_ms = vad_silence_ms
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._listener_task: Optional[asyncio.Task] = None
+        self._writer_task: Optional[asyncio.Task] = None
+        self._audio_queue: asyncio.Queue = asyncio.Queue()
         self._final_transcript = ""
         self._completed = asyncio.Event()
         self._session_ready = asyncio.Event()
@@ -92,6 +103,7 @@ class RealtimeTranscriber:
             ping_timeout=10,
         )
         self._listener_task = asyncio.create_task(self._listen())
+        self._writer_task = asyncio.create_task(self._write_audio())
         try:
             await asyncio.wait_for(self._session_ready.wait(), timeout=10.0)
         except asyncio.TimeoutError:
@@ -110,10 +122,20 @@ class RealtimeTranscriber:
             err = self._error
             await self.close()
             raise RuntimeError(err)
-        logger.info("Realtime STT session ready (lang=%s, delay=%s).", self.language, self.delay)
+        logger.info(
+            "Realtime STT session ready (model=%s, lang=%s, delay=%s).",
+            self.model, self.language, self.delay,
+        )
 
     async def _send_session_update(self) -> None:
         assert self._ws is not None
+        transcription: dict = {"model": self.model}
+        if self.model in NEW_GEN_MODELS:
+            # New generation: `languages` array replaces `language`.
+            if self.language:
+                transcription["languages"] = [self.language]
+        else:
+            transcription["language"] = self.language
         payload = {
             "type": "session.update",
             "session": {
@@ -122,28 +144,39 @@ class RealtimeTranscriber:
                     "input": {
                         "format": {"type": "audio/pcm", "rate": config.MIC_SAMPLE_RATE},
                         "turn_detection": None,
-                        "transcription": {
-                            "model": "gpt-realtime-whisper",
-                            "language": self.language,
-                        },
+                        "transcription": transcription,
                     },
                 },
             },
         }
         await self._ws.send(json.dumps(payload))
 
-    async def append(self, pcm16_bytes: bytes) -> None:
-        """Send audio directly to the API for real-time processing."""
+    def append(self, pcm16_bytes: bytes) -> None:
+        """Queue audio for real-time upload (synchronous; safe from the WS loop).
+
+        The server's message loop calls this without awaiting, so upload runs
+        on a dedicated writer task that preserves chunk order.
+        """
         if not pcm16_bytes or self._closed or self._ws is None:
             return
         self._audio_buffer.append(pcm16_bytes)
-        try:
-            await self._ws.send(json.dumps({
-                "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(pcm16_bytes).decode("ascii"),
-            }))
-        except Exception as exc:
-            logger.debug("Failed to send audio chunk: %s", exc)
+        self._audio_queue.put_nowait(pcm16_bytes)
+
+    async def _write_audio(self) -> None:
+        while True:
+            pcm = await self._audio_queue.get()
+            try:
+                if self._ws is not None and not self._closed:
+                    await self._ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(pcm).decode("ascii"),
+                    }))
+            except asyncio.CancelledError:
+                self._audio_queue.task_done()
+                raise
+            except Exception as exc:
+                logger.debug("Failed to send audio chunk: %s", exc)
+            self._audio_queue.task_done()
 
     async def finish(self, timeout_s: float = 15.0, already_committed: bool = False) -> str:
         """Commit audio buffer and wait for final transcript.
@@ -158,6 +191,12 @@ class RealtimeTranscriber:
         logger.info("Realtime STT: finishing (%.1f ms audio, committed=%s).", total_ms, already_committed)
 
         self._audio_buffer.clear()
+
+        # Ensure every queued chunk has actually been uploaded before commit.
+        try:
+            await asyncio.wait_for(self._audio_queue.join(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("Realtime STT: audio upload queue did not drain in 10 s.")
 
         if not already_committed:
             if total_ms < 100:
@@ -196,6 +235,12 @@ class RealtimeTranscriber:
             return
         self._closed = True
         self._audio_buffer.clear()
+        if self._writer_task and not self._writer_task.done():
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()
             try:
@@ -284,12 +329,17 @@ async def transcribe_batch(
 
     wav_bytes = pcm16_to_wav_bytes(pcm_chunks, sample_rate)
     client = _get_openai()
-    response = await client.audio.transcriptions.create(
-        model=model,
-        file=("audio.wav", wav_bytes, "audio/wav"),
-        language=language,
-        response_format="text",
-    )
+    kwargs: dict = {
+        "model": model,
+        "file": ("audio.wav", wav_bytes, "audio/wav"),
+        "response_format": "text",
+    }
+    if model in NEW_GEN_MODELS:
+        if language:
+            kwargs["extra_body"] = {"languages": [language]}
+    elif language:
+        kwargs["language"] = language
+    response = await client.audio.transcriptions.create(**kwargs)
     if isinstance(response, str):
         return response.strip()
     text = getattr(response, "text", None)
