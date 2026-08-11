@@ -209,8 +209,18 @@ def _split_sentences(text: str, min_chars: int = 40) -> list:
     return merged
 
 
+_ORPHAN_TAIL_RE = re.compile(
+    r"\b(a|an|the|to|for|of|in|on|at|with|and|or|but|what's|whats|who|which)$",
+    re.IGNORECASE,
+)
+
+
 def _split_first_clause(text: str, min_chars: int = 12) -> list:
-    """Flush first spoken clause early; terminal .!? flushes even if short."""
+    """Flush first spoken clause early; terminal .!? flushes even if short.
+
+    Do not flush on a dangling comma after a short orphan (article/preposition)
+    — that produced fragments like \"What's the company,\".
+    """
     raw = _CLAUSE_RE.split(text)
     merged = []
     buf = ""
@@ -220,6 +230,10 @@ def _split_first_clause(text: str, min_chars: int = 12) -> list:
         if stripped and stripped[-1] in ".!?…":
             merged.append(buf)
             buf = ""
+        elif stripped.endswith(","):
+            # Keep going — first-clause comma cuts caused orphan fragments
+            # like "What's the company," before the rest of the question.
+            continue
         elif len(buf) >= min_chars:
             merged.append(buf)
             buf = ""
@@ -229,7 +243,23 @@ def _split_first_clause(text: str, min_chars: int = 12) -> list:
 
 
 def _norm_transcript(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip().lower())
+    t = (text or "").strip().lower()
+    t = t.replace("’", "'").replace("‘", "'")
+    t = re.sub(r"\bit's\b", "it is", t)
+    t = re.sub(r"\bthats\b", "that is", t)
+    t = re.sub(r"\bthat's\b", "that is", t)
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _transcript_substantial(text: str) -> bool:
+    """Reject garbage speculate STT (e.g. 'LB') before starting a soft LLM turn."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    alnum = re.sub(r"[^a-zA-Z0-9]+", "", t)
+    words = [w for w in re.split(r"\s+", t) if w]
+    return len(alnum) >= 12 or len(words) >= 3
 
 
 def _transcripts_match(a: str, b: str) -> bool:
@@ -1091,6 +1121,13 @@ async def ws_chat(ws: WebSocket):
                         if not text:
                             return
                         session.speculate_transcript = text
+                        if not _transcript_substantial(text):
+                            logger.info(
+                                "[%s] Speculate SKIP (too short): %r",
+                                session.id,
+                                text[:40],
+                            )
+                            return
                         async with session._turn_lock:
                             if seq != session.speculate_seq:
                                 return
@@ -1280,13 +1317,18 @@ async def ws_chat(ws: WebSocket):
                                 (pending or "")[:60],
                             )
                         else:
+                            spec_snap = session.speculate_transcript or ""
+                            had_soft = bool(session.speculate_active or spec_snap)
                             if cancel_active_turn(session):
                                 await send_event({"type": "turn_cancelled"})
-                                if session.speculate_transcript:
-                                    logger.info(
-                                        "[%s] Speculate MISS — restarting turn",
-                                        session.id,
-                                    )
+                            if had_soft:
+                                logger.info(
+                                    "[%s] Speculate MISS — restarting turn "
+                                    "(spec=%r final=%r)",
+                                    session.id,
+                                    spec_snap[:60],
+                                    transcript[:60],
+                                )
                             await start_user_turn(session, ws, transcript)
                 else:
                     if cancel_active_turn(session):
@@ -1598,7 +1640,9 @@ async def handle_user_text(
                     await send({"type": "tts_start", "num_sentences": 1, "sample_rate": 24000})
 
                 spoken, instruct = _extract_tts_instruct(" ".join(batch))
-                if not instruct:
+                # Defer sticky coach emotion: first clause stays on the fast
+                # no-instruct path (~150ms TTFA). Apply default from sentence 2+.
+                if not instruct and tts_sentence_count > 1:
                     instruct = session.default_tts_instruct or ""
                 if not spoken:
                     if ended:
@@ -1610,6 +1654,7 @@ async def handle_user_text(
                         await _dispatch_tts(
                             ws, session, spoken, session.voice_id, session.language,
                             turn_id, instruct=instruct,
+                            allow_default_instruct=(tts_sentence_count > 1),
                         )
 
                 if ended:
@@ -1859,10 +1904,12 @@ async def _dispatch_tts(
     language: str,
     turn_id: int,
     instruct: str = "",
+    allow_default_instruct: bool = True,
 ):
     """Send one sentence to the TTS server and relay audio (caller holds tts_lock)."""
     text, tag_instruct = _extract_tts_instruct(text)
-    instruct = (instruct or tag_instruct or session.default_tts_instruct or "").strip()
+    sticky = session.default_tts_instruct if allow_default_instruct else ""
+    instruct = (instruct or tag_instruct or sticky or "").strip()
     if not text:
         return
     if instruct:
