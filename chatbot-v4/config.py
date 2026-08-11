@@ -36,6 +36,18 @@ OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o")
 MAX_CONVERSATION_TURNS = int(os.getenv("MAX_CONVERSATION_TURNS", "60"))
+# Comma-separated fallback chain tried when the primary LLM times out / refuses.
+# Empty → sensible cross-provider defaults (Claude→gpt-4o-mini→gpt-4o, OpenAI→Haiku).
+_LLM_FALLBACK_RAW = os.getenv(
+    "LLM_FALLBACK_MODELS", "gpt-4o-mini,gpt-4o,claude-haiku-4-5"
+)
+LLM_FALLBACK_MODELS: list[str] = [
+    m.strip() for m in _LLM_FALLBACK_RAW.split(",") if m.strip()
+]
+# Fail fast so the call can switch providers instead of hanging silent.
+LLM_CONNECT_TIMEOUT_S = float(os.getenv("LLM_CONNECT_TIMEOUT_S", "5"))
+LLM_REQUEST_TIMEOUT_S = float(os.getenv("LLM_REQUEST_TIMEOUT_S", "20"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
 # Cache large static system packs (instruction + CV) across turns.
 ANTHROPIC_PROMPT_CACHE: bool = os.getenv("ANTHROPIC_PROMPT_CACHE", "true").lower() in (
     "1", "true", "yes", "on",

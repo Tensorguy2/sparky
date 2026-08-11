@@ -31,6 +31,20 @@ _AGENT_NAME_BLOCKLIST = {
     "bertrand kalisa",
     "kalisa",
 }
+# Common false positives from STT / assistant phrasing ("are you there?").
+_NAME_FALSE_POSITIVES = {
+    "there",
+    "here",
+    "friend",
+    "calling",
+    "regarding",
+    "about",
+    "just",
+    "looking",
+    "everyone",
+    "anybody",
+    "someone",
+}
 
 _JOB_MAX = 160
 
@@ -84,7 +98,7 @@ def _clean_name(raw: str) -> str:
     name = re.sub(r"\s+", " ", (raw or "").strip(" .,!?;:"))
     if not name or len(name) > 48:
         return ""
-    if name.lower() in _AGENT_NAME_BLOCKLIST:
+    if name.lower() in _AGENT_NAME_BLOCKLIST or name.lower() in _NAME_FALSE_POSITIVES:
         return ""
     # Reject common false positives
     if name.lower() in {"here", "calling", "regarding", "about", "just", "looking"}:

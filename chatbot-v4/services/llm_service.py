@@ -3,6 +3,9 @@ Multi-provider LLM service.
 
 Routes generation requests to OpenAI or Anthropic based on the requested
 model, yielding streamed text tokens as an async generator.
+
+On connect/timeout/API failures before the first token, automatically tries
+``config.LLM_FALLBACK_MODELS`` so phone calls do not go silent.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import logging
 from typing import Any, AsyncGenerator, List, Optional, Union
 
 import anthropic
+import httpx
 import openai
 
 import config
@@ -25,19 +29,86 @@ _anthropic_client: anthropic.AsyncAnthropic | None = None
 # Skip cache_control on tiny system prompts (below Haiku's practical floor).
 _CACHE_MIN_CHARS = 6000
 
+_RETRYABLE = (
+    TimeoutError,
+    ConnectionError,
+    httpx.TimeoutException,
+    httpx.TransportError,
+    openai.APITimeoutError,
+    openai.APIConnectionError,
+    openai.RateLimitError,
+    openai.InternalServerError,
+    anthropic.APITimeoutError,
+    anthropic.APIConnectionError,
+    anthropic.RateLimitError,
+    anthropic.InternalServerError,
+)
+
+
+def _http_timeout() -> httpx.Timeout:
+    connect = float(getattr(config, "LLM_CONNECT_TIMEOUT_S", 5) or 5)
+    total = float(getattr(config, "LLM_REQUEST_TIMEOUT_S", 20) or 20)
+    return httpx.Timeout(total, connect=connect)
+
 
 def _get_openai() -> openai.AsyncOpenAI:
     global _openai_client
     if _openai_client is None:
-        _openai_client = openai.AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        _openai_client = openai.AsyncOpenAI(
+            api_key=config.OPENAI_API_KEY,
+            timeout=_http_timeout(),
+            max_retries=int(getattr(config, "LLM_MAX_RETRIES", 1) or 0),
+        )
     return _openai_client
 
 
 def _get_anthropic() -> anthropic.AsyncAnthropic:
     global _anthropic_client
     if _anthropic_client is None:
-        _anthropic_client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+        _anthropic_client = anthropic.AsyncAnthropic(
+            api_key=config.ANTHROPIC_API_KEY,
+            timeout=_http_timeout(),
+            max_retries=int(getattr(config, "LLM_MAX_RETRIES", 1) or 0),
+        )
     return _anthropic_client
+
+
+def _model_has_key(model: str) -> bool:
+    try:
+        provider = config.provider_for_model(model)
+    except ValueError:
+        return False
+    if provider == "openai":
+        return bool(config.OPENAI_API_KEY)
+    if provider == "anthropic":
+        return bool(config.ANTHROPIC_API_KEY)
+    return False
+
+
+def _fallback_chain(primary: str) -> list[str]:
+    """Primary first, then configured fallbacks (deduped, key-available only)."""
+    seen: set[str] = set()
+    chain: list[str] = []
+    for model in [primary, *(getattr(config, "LLM_FALLBACK_MODELS", None) or [])]:
+        m = (model or "").strip()
+        if not m or m in seen:
+            continue
+        seen.add(m)
+        if not _model_has_key(m):
+            logger.warning("Skipping LLM candidate %s (missing API key)", m)
+            continue
+        chain.append(m)
+    return chain
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, _RETRYABLE):
+        return True
+    # Anthropic/OpenAI sometimes wrap status 529 / 503
+    status = getattr(exc, "status_code", None)
+    if status in (408, 429, 500, 502, 503, 504, 529):
+        return True
+    return False
 
 
 def _openai_uses_max_completion_tokens(model: str) -> bool:
@@ -155,6 +226,23 @@ async def warm_prompt_cache(
         logger.exception("Anthropic prompt-cache warmup failed (model=%s)", model)
 
 
+async def _stream_provider(
+    model: str,
+    system_prompt: str,
+    messages: List[dict],
+    params: ModelParams,
+) -> AsyncGenerator[str, None]:
+    provider = config.provider_for_model(model)
+    if provider == "openai":
+        async for token in _stream_openai(model, system_prompt, messages, params):
+            yield token
+    elif provider == "anthropic":
+        async for token in _stream_anthropic(model, system_prompt, messages, params):
+            yield token
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
+
+
 async def stream_chat(
     model: str,
     system_prompt: str,
@@ -163,6 +251,10 @@ async def stream_chat(
 ) -> AsyncGenerator[str, None]:
     """
     Stream LLM response tokens.
+
+    Tries ``model`` first, then ``LLM_FALLBACK_MODELS`` if the provider fails
+    before producing any tokens (timeout / connection / overloaded). Mid-stream
+    failures after the first token are not retried (avoids double speech).
 
     Args:
         model: Model ID (e.g. "gpt-4o", "claude-sonnet-4-20250514")
@@ -173,17 +265,46 @@ async def stream_chat(
     Yields:
         Individual text tokens/chunks as they arrive.
     """
-    provider = config.provider_for_model(model)
     p = params or ModelParams()
+    chain = _fallback_chain(model)
+    if not chain:
+        raise RuntimeError(f"No LLM candidates available for model={model!r}")
 
-    if provider == "openai":
-        async for token in _stream_openai(model, system_prompt, messages, p):
-            yield token
-    elif provider == "anthropic":
-        async for token in _stream_anthropic(model, system_prompt, messages, p):
-            yield token
-    else:
-        raise ValueError(f"Unsupported provider: {provider}")
+    last_err: BaseException | None = None
+    for idx, candidate in enumerate(chain):
+        produced = False
+        try:
+            async for token in _stream_provider(
+                candidate, system_prompt, messages, p
+            ):
+                if not produced:
+                    produced = True
+                    if idx > 0:
+                        logger.warning(
+                            "LLM fallback engaged: %s -> %s",
+                            model,
+                            candidate,
+                        )
+                yield token
+            return
+        except Exception as exc:
+            last_err = exc
+            if produced:
+                # Already spoke — do not restart on another model.
+                raise
+            if idx + 1 >= len(chain) or not _is_retryable(exc):
+                raise
+            logger.warning(
+                "LLM %s failed before tokens (%s: %s); trying fallback %s",
+                candidate,
+                type(exc).__name__,
+                exc,
+                chain[idx + 1],
+            )
+            continue
+
+    assert last_err is not None
+    raise last_err
 
 
 async def _stream_openai(
