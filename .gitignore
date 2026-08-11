@@ -26,6 +26,11 @@ chatbot_start.log
 
 # Large / local artifacts
 models/
+# Keep chatbot Python packages named models/ (not ML weight dirs).
+!chatbot-v4/models/
+!chatbot-v4/models/**/*.py
+!chatbot/models/
+!chatbot/models/**/*.py
 *.wav
 *.mp3
 *.pt

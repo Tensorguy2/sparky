@@ -35,7 +35,16 @@ ALLOW_ADMIN_RESTART = os.getenv("ALLOW_ADMIN_RESTART", "true").lower() in ("1", 
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o")
-MAX_CONVERSATION_TURNS = int(os.getenv("MAX_CONVERSATION_TURNS", "30"))
+MAX_CONVERSATION_TURNS = int(os.getenv("MAX_CONVERSATION_TURNS", "60"))
+# Cache large static system packs (instruction + CV) across turns.
+ANTHROPIC_PROMPT_CACHE: bool = os.getenv("ANTHROPIC_PROMPT_CACHE", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+_ANTHROPIC_TTL_RAW = os.getenv("ANTHROPIC_CACHE_TTL", "5m").strip().lower()
+ANTHROPIC_CACHE_TTL = "1h" if _ANTHROPIC_TTL_RAW in ("1h", "1hour", "hour") else "5m"
+ANTHROPIC_CACHE_WARMUP: bool = os.getenv("ANTHROPIC_CACHE_WARMUP", "true").lower() in (
+    "1", "true", "yes", "on",
+)
 
 AVAILABLE_MODELS: dict = {
     "openai": [
@@ -65,8 +74,14 @@ def provider_for_model(model_id: str) -> str:
 # --- STT ---------------------------------------------------------------------
 DEFAULT_STT_MODEL = os.getenv("DEFAULT_STT_MODEL", "local:parakeet-tdt-0.6b-v2")
 STT_LANGUAGE = os.getenv("STT_LANGUAGE", "en")
-STT_REALTIME_DELAY = os.getenv("STT_REALTIME_DELAY", "low")
-STT_SERVER_VAD: bool = os.getenv("STT_SERVER_VAD", "true").lower() in ("1", "true", "yes")
+# gpt-live-transcribe: minimal | low | medium | high | xhigh
+_STT_DELAY_RAW = os.getenv("STT_REALTIME_DELAY", "minimal").strip().lower()
+STT_REALTIME_DELAY = (
+    _STT_DELAY_RAW
+    if _STT_DELAY_RAW in ("minimal", "low", "medium", "high", "xhigh")
+    else "minimal"
+)
+STT_SERVER_VAD: bool = os.getenv("STT_SERVER_VAD", "false").lower() in ("1", "true", "yes")
 STT_VAD_SILENCE_MS = int(os.getenv("STT_VAD_SILENCE_MS", "500"))
 MIC_SAMPLE_RATE = 24000
 
@@ -107,6 +122,10 @@ DEFAULT_FLOW = os.getenv("DEFAULT_FLOW", "calltypes")
 # --- Fillers -----------------------------------------------------------------
 FILLERS_ENABLED = os.getenv("FILLERS_ENABLED", "true").lower() in ("1", "true", "yes")
 FILLER_PROBABILITY: float = float(os.getenv("FILLER_PROBABILITY", "0.5"))
+# Only play a filler if the real reply TTS has not started within this delay.
+FILLER_DELAY_MS: float = float(os.getenv("FILLER_DELAY_MS", "600"))
+# Amplitude scale for filler PCM (1.0 = full; keep quiet under the real voice).
+FILLER_GAIN: float = float(os.getenv("FILLER_GAIN", "0.35"))
 
 # --- Sessions ----------------------------------------------------------------
 DEFAULT_SESSION_ID = os.getenv("DEFAULT_SESSION_ID", "last")

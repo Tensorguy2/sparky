@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import AsyncGenerator, List, Optional
+from typing import Any, AsyncGenerator, List, Optional, Union
 
 import anthropic
 import openai
@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 _openai_client: openai.AsyncOpenAI | None = None
 _anthropic_client: anthropic.AsyncAnthropic | None = None
+
+# Skip cache_control on tiny system prompts (below Haiku's practical floor).
+_CACHE_MIN_CHARS = 6000
 
 
 def _get_openai() -> openai.AsyncOpenAI:
@@ -61,6 +64,95 @@ def _anthropic_supports_temperature(model: str) -> bool:
     if "opus" in m:
         return False
     return True
+
+
+def _cache_control_block() -> dict[str, str]:
+    block: dict[str, str] = {"type": "ephemeral"}
+    if getattr(config, "ANTHROPIC_CACHE_TTL", "5m") == "1h":
+        block["ttl"] = "1h"
+    return block
+
+
+def _anthropic_system(system_prompt: str) -> Union[str, List[dict[str, Any]]]:
+    """Wrap system prompt with prompt-cache breakpoint when enabled."""
+    text = system_prompt or ""
+    if (
+        not getattr(config, "ANTHROPIC_PROMPT_CACHE", True)
+        or len(text) < _CACHE_MIN_CHARS
+    ):
+        return text
+    return [
+        {
+            "type": "text",
+            "text": text,
+            "cache_control": _cache_control_block(),
+        }
+    ]
+
+
+def _log_cache_usage(usage: Any, *, model: str, kind: str) -> None:
+    if usage is None:
+        return
+    created = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    inp = int(getattr(usage, "input_tokens", 0) or 0)
+    out = int(getattr(usage, "output_tokens", 0) or 0)
+    logger.info(
+        "Anthropic %s usage | model=%s input=%d output=%d cache_write=%d cache_read=%d",
+        kind,
+        model,
+        inp,
+        out,
+        created,
+        read,
+    )
+
+
+async def warm_prompt_cache(
+    model: str,
+    system_prompt: str,
+    params: ModelParams | None = None,
+) -> None:
+    """Prefill Anthropic cache so the first real turn hits a warm prefix.
+
+    Uses max_tokens=1 with a dummy user message; breakpoint stays on system
+    (not the placeholder) so the next turn shares the same cache key.
+    Temperature must match the live turn or the cache entry may not hit.
+    """
+    if not getattr(config, "ANTHROPIC_PROMPT_CACHE", True):
+        return
+    if not getattr(config, "ANTHROPIC_CACHE_WARMUP", True):
+        return
+    if not system_prompt or len(system_prompt) < _CACHE_MIN_CHARS:
+        return
+    try:
+        if config.provider_for_model(model) != "anthropic":
+            return
+    except ValueError:
+        return
+    if not config.ANTHROPIC_API_KEY:
+        return
+
+    client = _get_anthropic()
+    system = _anthropic_system(system_prompt)
+    if isinstance(system, str):
+        return
+
+    p = params or ModelParams()
+    create_kwargs: dict[str, Any] = {
+        "model": model,
+        "system": system,
+        "messages": [{"role": "user", "content": "warmup"}],
+        "max_tokens": 1,
+    }
+    if _anthropic_supports_temperature(model):
+        create_kwargs["temperature"] = p.temperature
+
+    try:
+        resp = await client.messages.create(**create_kwargs)
+        _log_cache_usage(getattr(resp, "usage", None), model=model, kind="warmup")
+    except Exception:
+        logger.exception("Anthropic prompt-cache warmup failed (model=%s)", model)
 
 
 async def stream_chat(
@@ -217,7 +309,7 @@ async def _call_tool_anthropic(
     client = _get_anthropic()
     resp = await client.messages.create(
         model=model,
-        system=system_prompt,
+        system=_anthropic_system(system_prompt),
         messages=messages,
         max_tokens=max_tokens,
         tools=[{
@@ -227,6 +319,7 @@ async def _call_tool_anthropic(
         }],
         tool_choice={"type": "tool", "name": tool_name},
     )
+    _log_cache_usage(getattr(resp, "usage", None), model=model, kind="tool")
     for block in resp.content:
         if getattr(block, "type", None) == "tool_use":
             inp = getattr(block, "input", None)
@@ -242,15 +335,21 @@ async def _stream_anthropic(
     params: ModelParams,
 ) -> AsyncGenerator[str, None]:
     client = _get_anthropic()
+    system = _anthropic_system(system_prompt)
+    cached = isinstance(system, list)
 
     logger.info(
-        "Anthropic stream | model=%s temp=%.2f max_tokens=%d turns=%d",
-        model, params.temperature, params.max_tokens, len(messages),
+        "Anthropic stream | model=%s temp=%.2f max_tokens=%d turns=%d cache=%s",
+        model,
+        params.temperature,
+        params.max_tokens,
+        len(messages),
+        "on" if cached else "off",
     )
 
     create_kwargs: dict = {
         "model": model,
-        "system": system_prompt,
+        "system": system,
         "messages": messages,
         "max_tokens": params.max_tokens,
     }
@@ -260,3 +359,8 @@ async def _stream_anthropic(
     async with client.messages.stream(**create_kwargs) as stream:
         async for text in stream.text_stream:
             yield text
+        try:
+            final = await stream.get_final_message()
+            _log_cache_usage(getattr(final, "usage", None), model=model, kind="stream")
+        except Exception:
+            logger.debug("Anthropic stream: could not read final usage", exc_info=True)

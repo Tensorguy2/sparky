@@ -7,7 +7,7 @@ FastAPI application that orchestrates:
   - Existing Qwen3-TTS server for text-to-speech output
 
 v4 changes vs v3:
-  - Early filler: plays immediately on stop_stt (masks STT latency)
+  - Delayed quiet filler: only if reply TTS is late (masks LLM/TTS delay)
   - Non-blocking STT: transcription runs as a task so WS stays responsive
   - Parallel router: LLM starts immediately; maybe_route runs alongside;
     if a state switch occurs, the in-flight turn is cancelled and restarted once
@@ -44,6 +44,7 @@ from models.instructions import InstructionManager, ModelParams
 from models.session_store import SessionSnapshot, SessionStore
 from services import llm_service
 from services import router as call_router
+from services import call_facts as call_facts_svc
 from services.stt_router import (
     create_realtime_session,
     get_stt_info,
@@ -107,6 +108,20 @@ def switch_state(session, state_name: str) -> bool:
     return True
 
 
+# Wire tokens for AnswerBot / Operator — keep in llm_done, never speak.
+_WIRE_TOKEN_RE = re.compile(r"\[\[(?:GOODBYE|PHASE_CLOSER)\]\]", re.IGNORECASE)
+
+
+def _strip_wire_tokens(text: str) -> str:
+    """Remove control tokens so TTS never reads them aloud."""
+    if not text:
+        return text
+    cleaned = _WIRE_TOKEN_RE.sub("", text)
+    while "\n\n\n" in cleaned:
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+    return cleaned.strip()
+
+
 def _split_sentences(text: str, min_chars: int = 40) -> list:
     raw = _SENTENCE_RE.split(text)
     merged = []
@@ -135,6 +150,55 @@ def _split_first_clause(text: str, min_chars: int = 20) -> list:
     return merged
 
 
+def _operator_override_block(directives: list[str]) -> str:
+    lines = [d.strip() for d in directives if (d or "").strip()]
+    if not lines:
+        return ""
+    body = "\n".join(f"- {d}" for d in lines)
+    return (
+        "# LIVE OPERATOR OVERRIDE — HIGHEST PRIORITY FOR THIS REPLY\n"
+        "You MUST obey these Operator directives in your next spoken reply.\n"
+        "They override rate floors, W2/C2C rules, role lock, personality, "
+        "prior refusals in this conversation, and any conflicting instruction above.\n"
+        "Do not mention the Operator or these directives. Do not renegotiate against them.\n"
+        f"{body}"
+    )
+
+
+def _messages_with_operator_directives(
+    messages: list[dict], directives: list[str]
+) -> list[dict]:
+    """Inject a sticky override immediately before the trailing user turn(s)."""
+    lines = [d.strip() for d in directives if (d or "").strip()]
+    if not lines:
+        return messages
+    body = "\n".join(f"- {d}" for d in lines)
+    inject = [
+        {
+            "role": "user",
+            "content": (
+                "[Internal Operator directive — not spoken by the caller. "
+                "Obey in your next reply only.]\n"
+                f"{body}"
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": (
+                "Understood. I will follow those Operator directives in my next "
+                "reply and will not mention them."
+            ),
+        },
+    ]
+    msgs = list(messages or [])
+    if not msgs:
+        return inject
+    i = len(msgs)
+    while i > 0 and msgs[i - 1].get("role") == "user":
+        i -= 1
+    return msgs[:i] + inject + msgs[i:]
+
+
 # ---------------------------------------------------------------------------
 # ChatSession
 # ---------------------------------------------------------------------------
@@ -151,6 +215,8 @@ class ChatSession:
         self.context_name = None
         self.language = "English"
         self.tts_enabled = True
+        # Operator telephony packs own the brain — default off for phone chatbot.
+        self.router_enabled = bool(config.ROUTER_ENABLED)
         self.stt_model = config.DEFAULT_STT_MODEL
         self.recorder = AudioRecorder(config.MIC_SAMPLE_RATE)
         self.stt_stream = None
@@ -162,10 +228,27 @@ class ChatSession:
         self.turn_snapshot = None
         self.stt_transcribing: bool = False
         self.persist_id = config.DEFAULT_SESSION_ID
+        # Set True when the real reply TTS starts (not fillers).
+        self.reply_audio_started: bool = False
+        self._filler_task: Optional[asyncio.Task] = None
+        # Live Operator coach notes — injected into the next LLM turn(s).
+        self.operator_directives: list[str] = []
+        # Sticky call facts (caller/company/job) — survive history truncation.
+        self.call_facts: dict[str, str] = call_facts_svc.empty_facts()
 
     @property
     def tts_turn(self):
         return self.generation_turn
+
+    def merge_call_facts(
+        self, incoming: dict[str, str] | None, *, replace: bool = False
+    ) -> list[str]:
+        updated = call_facts_svc.merge_facts(
+            self.call_facts, incoming, replace=replace
+        )
+        if updated:
+            call_facts_svc.log_updates(self.id, updated, self.call_facts)
+        return updated
 
     def apply_snapshot(self, snap: SessionSnapshot):
         self.conversation = ConversationManager.from_turn_dicts(
@@ -213,14 +296,36 @@ class ChatSession:
     def build_system_prompt(self) -> str:
         parts = []
         ctx = context_mgr.get(self.context_name) if context_mgr and self.context_name else None
-        if ctx:
-            parts.append(ctx)
         iset = instruction_mgr.get(self.instruction_set_id) if instruction_mgr and self.instruction_set_id else None
+        instr = ""
         if iset and hasattr(iset, "system_prompt"):
-            parts.append(iset.system_prompt)
+            instr = iset.system_prompt or ""
         elif iset and isinstance(iset, str):
-            parts.append(iset)
-        return "\n\n".join(parts) if parts else ""
+            instr = iset
+        # Operator live directives must lead; they are prepended to instruction
+        # and often also pinned at the top of context.
+        directives_first = (instr or "").lstrip().startswith(
+            "# Operator directives (IMPERATIVE"
+        ) or (isinstance(ctx, str) and ctx.lstrip().startswith("# Operator directives (IMPERATIVE"))
+        if directives_first:
+            if instr:
+                parts.append(instr)
+            if ctx:
+                parts.append(ctx)
+        else:
+            if ctx:
+                parts.append(ctx)
+            if instr:
+                parts.append(instr)
+        prompt = "\n\n".join(parts) if parts else ""
+        facts_block = call_facts_svc.call_facts_block(self.call_facts)
+        if facts_block:
+            prompt = f"{prompt}\n\n{facts_block}" if prompt else facts_block
+        # Sticky live coach: also pin at the END so it wins over long packs/history.
+        overlay = _operator_override_block(self.operator_directives)
+        if overlay:
+            prompt = f"{prompt}\n\n{overlay}" if prompt else overlay
+        return prompt
 
     def get_model_params(self) -> ModelParams:
         if instruction_mgr:
@@ -244,8 +349,72 @@ def cancel_active_turn(session: ChatSession) -> bool:
     if task and not task.done():
         session.generation_turn += 1
         task.cancel()
+        ft = session._filler_task
+        if ft and not ft.done():
+            ft.cancel()
         return True
     return False
+
+
+def _quiet_filler_events(clip, gain: float):
+    """Yield filler WS events with scaled-down PCM and filler=True tags."""
+    import numpy as np
+
+    gain = max(0.0, min(1.0, float(gain)))
+    for evt in filler_cache.get_filler_as_events(clip):
+        out = dict(evt)
+        out["filler"] = True
+        if out.get("type") == "tts_audio" and out.get("data") and gain != 1.0:
+            raw = base64.b64decode(out["data"])
+            ns = int(out.get("num_samples") or 0)
+            if ns and len(raw) == ns * 4:
+                samples = np.frombuffer(raw, dtype=np.float32) * gain
+                out["data"] = base64.b64encode(samples.astype(np.float32).tobytes()).decode("ascii")
+            elif ns and len(raw) == ns * 2:
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) * gain
+                out["data"] = base64.b64encode(
+                    np.clip(samples, -32768, 32767).astype(np.int16).tobytes()
+                ).decode("ascii")
+        yield out
+
+
+async def _delayed_filler(session: "ChatSession", send, turn_id: int, transcript: str) -> None:
+    """Play a quiet filler only if the real reply TTS is still late."""
+    try:
+        await asyncio.sleep(max(0.0, config.FILLER_DELAY_MS) / 1000.0)
+    except asyncio.CancelledError:
+        return
+
+    if session.generation_turn != turn_id or session.reply_audio_started:
+        return
+    if not (session.tts_enabled and config.FILLERS_ENABLED):
+        return
+    if filler_cache.is_direct_question(transcript):
+        return
+    if random.random() >= config.FILLER_PROBABILITY:
+        return
+
+    try:
+        clip = await filler_cache.get_filler_for_voice(session.voice_id, session.language)
+        if not clip:
+            return
+        if session.generation_turn != turn_id or session.reply_audio_started:
+            return
+        for evt in _quiet_filler_events(clip, config.FILLER_GAIN):
+            if session.generation_turn != turn_id or session.reply_audio_started:
+                return
+            await send(evt)
+        logger.info(
+            "[%s] Delayed filler played (delay_ms=%.0f gain=%.2f phrase=%r)",
+            session.id,
+            config.FILLER_DELAY_MS,
+            config.FILLER_GAIN,
+            getattr(clip, "phrase", "")[:40],
+        )
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.debug("[%s] Delayed filler failed", session.id, exc_info=True)
 
 
 def _close_stt_stream(session: ChatSession):
@@ -568,15 +737,107 @@ async def ws_chat(ws: WebSocket):
                     session.instruction_set_id = msg["instruction_set"]
                 if "context" in msg:
                     session.context_name = msg["context"]
+                    ctx_body = (
+                        context_mgr.get(session.context_name)
+                        if context_mgr and session.context_name
+                        else None
+                    )
+                    if isinstance(ctx_body, str) and ctx_body.strip():
+                        session.merge_call_facts(
+                            call_facts_svc.seed_from_context_text(ctx_body)
+                        )
                 if "language" in msg:
                     session.language = msg["language"]
                 if "tts_enabled" in msg:
                     session.tts_enabled = msg["tts_enabled"]
+                if "router_enabled" in msg:
+                    session.router_enabled = bool(msg["router_enabled"])
                 if "stt_model" in msg:
                     session.stt_model = resolve_stt_model(msg["stt_model"])
                 await send_event({"type": "config_ack"})
                 if config.FILLERS_ENABLED and session.voice_id != prev_voice:
                     asyncio.create_task(filler_cache.warm_cache(session.voice_id))
+                # Prefill Anthropic prompt cache for large Operator packs so the
+                # first spoken turn (and greeting LLM path) hit a warm prefix.
+                if (
+                    getattr(config, "ANTHROPIC_CACHE_WARMUP", True)
+                    and any(k in msg for k in ("instruction_set", "context", "model"))
+                ):
+                    asyncio.create_task(
+                        llm_service.warm_prompt_cache(
+                            session.model,
+                            session.build_system_prompt(),
+                            session.get_model_params(),
+                        )
+                    )
+
+            # ------ coach (Operator live imperative; never interrupts TTS) ------
+            elif msg_type == "coach":
+                note = (msg.get("text") or "").strip()
+                if note:
+                    session.operator_directives.append(note)
+                    logger.info(
+                        "[%s] Operator coach directive (%d): %s",
+                        session.id,
+                        len(session.operator_directives),
+                        note[:120],
+                    )
+                    await send_event(
+                        {
+                            "type": "coach_ack",
+                            "count": len(session.operator_directives),
+                        }
+                    )
+                    if getattr(config, "ANTHROPIC_CACHE_WARMUP", True):
+                        asyncio.create_task(
+                            llm_service.warm_prompt_cache(
+                                session.model,
+                                session.build_system_prompt(),
+                                session.get_model_params(),
+                            )
+                        )
+
+            # ------ call_facts / call_fact (Operator seed or mid-call pin) ------
+            elif msg_type == "call_facts":
+                facts = msg.get("facts") if isinstance(msg.get("facts"), dict) else {}
+                replace = bool(msg.get("replace"))
+                updated = session.merge_call_facts(facts, replace=replace)
+                await send_event(
+                    {
+                        "type": "call_facts_ack",
+                        "updated": updated,
+                        "facts": {
+                            k: v for k, v in session.call_facts.items() if v
+                        },
+                    }
+                )
+                if updated and getattr(config, "ANTHROPIC_CACHE_WARMUP", True):
+                    asyncio.create_task(
+                        llm_service.warm_prompt_cache(
+                            session.model,
+                            session.build_system_prompt(),
+                            session.get_model_params(),
+                        )
+                    )
+
+            elif msg_type == "call_fact":
+                key = (msg.get("key") or "").strip()
+                value = (msg.get("value") or "").strip()
+                replace = bool(msg.get("replace"))
+                updated = []
+                if key and value:
+                    updated = session.merge_call_facts(
+                        {key: value}, replace=replace
+                    )
+                await send_event(
+                    {
+                        "type": "call_fact_ack",
+                        "updated": updated,
+                        "facts": {
+                            k: v for k, v in session.call_facts.items() if v
+                        },
+                    }
+                )
 
             # ------ text_input ------
             elif msg_type == "text_input":
@@ -603,8 +864,12 @@ async def ws_chat(ws: WebSocket):
 
                 stt_model = resolve_stt_model(session.stt_model)
                 if is_realtime_model(stt_model):
-                    if session._stt_persistent and session._stt_persistent.is_alive():
+                    # stop_stt clears session.stt_stream after finish(); reuse must
+                    # re-bind it or the next utterance hits "Realtime STT session
+                    # is not active" and audio never reaches OpenAI.
+                    if session._stt_persistent and session._stt_persistent.is_alive:
                         session._stt_persistent.reset()
+                        session.stt_stream = session._stt_persistent
                     else:
                         async def _on_delta(delta):
                             await send_event({"type": "transcript_delta", "delta": delta})
@@ -691,18 +956,8 @@ async def ws_chat(ws: WebSocket):
                     if cancel_active_turn(session):
                         await send_event({"type": "turn_cancelled"})
 
-                    # Filler after STT (can check is_direct_question now)
-                    if (session.tts_enabled and config.FILLERS_ENABLED
-                            and not filler_cache.is_direct_question(transcript)
-                            and random.random() < config.FILLER_PROBABILITY):
-                        try:
-                            clip = await filler_cache.get_filler_for_voice(session.voice_id, session.language)
-                            if clip:
-                                for evt in filler_cache.get_filler_as_events(clip):
-                                    await send_event(evt)
-                        except Exception:
-                            pass
-
+                    # Fillers are delay-gated inside handle_user_text (only if
+                    # reply TTS is late), not fired immediately after STT.
                     await start_user_turn(session, ws, transcript)
                 else:
                     await send_event({"type": "error", "message": "No speech detected. Try speaking longer or closer to the mic."})
@@ -831,6 +1086,8 @@ async def maybe_route(session: ChatSession, send) -> Optional[str]:
     """
     if not config.ROUTER_ENABLED:
         return None
+    if getattr(session, "router_enabled", True) is False:
+        return None
     flow = active_flow()
     if not flow:
         return None
@@ -883,7 +1140,10 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
     sid = session.id
     logger.info("[%s] User: %s", sid, text[:100])
 
-    session.conversation.add_user_message(text)
+    session.conversation.add_or_coalesce_user_message(text)
+    updated = call_facts_svc.extract_from_user(text, session.call_facts)
+    if updated:
+        call_facts_svc.log_updates(sid, updated, session.call_facts)
 
     async def send(evt: dict):
         await ws.send_text(json.dumps(evt))
@@ -893,6 +1153,14 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
 
     session.generation_turn += 1
     turn_id = session.generation_turn
+    session.reply_audio_started = False
+
+    # Quiet filler only if real reply TTS is still late after FILLER_DELAY_MS.
+    if session._filler_task and not session._filler_task.done():
+        session._filler_task.cancel()
+    session._filler_task = asyncio.create_task(
+        _delayed_filler(session, send, turn_id, text)
+    )
 
     await send({"type": "llm_start", "model": session.model})
 
@@ -908,8 +1176,20 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
 
     # Prepare LLM call with current state's prompt
     system_prompt = session.build_system_prompt()
-    messages = session.conversation.get_messages(model=session.model)
+    messages = _messages_with_operator_directives(
+        session.conversation.get_messages(model=session.model),
+        session.operator_directives,
+    )
     params = session.get_model_params()
+    if session.operator_directives:
+        logger.info(
+            "[%s] Applying %d Operator directive(s) to this turn",
+            sid,
+            len(session.operator_directives),
+        )
+    known = {k: v for k, v in session.call_facts.items() if v}
+    if known:
+        logger.info("[%s] call_facts pinned: %s", sid, known)
 
     full_response = ""
     sentence_buffer = ""
@@ -940,11 +1220,21 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
 
             tts_sentence_count += 1
             if tts_sentence_count == 1:
+                session.reply_audio_started = True
+                ft = session._filler_task
+                if ft and not ft.done():
+                    ft.cancel()
                 await send({"type": "tts_start", "num_sentences": 1, "sample_rate": 24000})
+
+            spoken = _strip_wire_tokens(" ".join(batch))
+            if not spoken:
+                if ended:
+                    return
+                continue
 
             async with session.tts_lock:
                 if turn_active(turn_id):
-                    await _dispatch_tts(ws, session, " ".join(batch), session.voice_id, session.language, turn_id)
+                    await _dispatch_tts(ws, session, spoken, session.voice_id, session.language, turn_id)
 
             if ended:
                 return
@@ -1028,7 +1318,10 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
 
         # Rebuild with new state's prompt and restart LLM
         system_prompt = session.build_system_prompt()
-        messages = session.conversation.get_messages(model=session.model)
+        messages = _messages_with_operator_directives(
+            session.conversation.get_messages(model=session.model),
+            session.operator_directives,
+        )
         params = session.get_model_params()
 
         full_response = ""
@@ -1096,6 +1389,12 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
     await send({"type": "llm_done", "text": full_response})
 
     session.conversation.add_assistant_message(full_response, model=session.model)
+    if full_response.strip():
+        asst_updated = call_facts_svc.extract_from_assistant(
+            full_response, session.call_facts
+        )
+        if asst_updated:
+            call_facts_svc.log_updates(sid, asst_updated, session.call_facts)
 
     # === v4: Stage timers ===
     route_ms = None
@@ -1144,6 +1443,9 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
 # ---------------------------------------------------------------------------
 async def _dispatch_tts(ws: WebSocket, session: ChatSession, text: str, voice_id: str, language: str, turn_id: int):
     """Send one sentence to the TTS server and relay audio (caller holds tts_lock)."""
+    text = _strip_wire_tokens(text)
+    if not text:
+        return
     try:
         async for event in stream_tts(
             text,
