@@ -58,8 +58,9 @@ from services.tts_client_v2 import (
     TTSInstability,
     reset_tts_server,
     shutdown_v2_client,
-    stream_tts_v2 as stream_tts,
+    stream_tts_v2,
 )
+from services.tts_client import stream_tts as stream_tts_with_instruct
 from services import filler_cache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -109,7 +110,52 @@ def switch_state(session, state_name: str) -> bool:
 
 
 # Wire tokens for AnswerBot / Operator — keep in llm_done, never speak.
-_WIRE_TOKEN_RE = re.compile(r"\[\[(?:GOODBYE|PHASE_CLOSER)\]\]", re.IGNORECASE)
+_WIRE_TOKEN_RE = re.compile(
+    r"\[\[(?:GOODBYE|PHASE_CLOSER|INSTRUCT:[^\]]*|EMO:[^\]]*)\]\]",
+    re.IGNORECASE,
+)
+_INSTRUCT_TOKEN_RE = re.compile(r"\[\[INSTRUCT:([^\]]*)\]\]", re.IGNORECASE)
+_EMO_TOKEN_RE = re.compile(r"\[\[EMO:([^\]]*)\]\]", re.IGNORECASE)
+
+_EMO_INSTRUCT_MAP = {
+    "friendly": "Speak warmly, friendly, and natural",
+    "cheerful": "Speak cheerfully with light energy",
+    "angry": "Speak angrily and firmly, clearly offended",
+    "apologetic": "Speak softly and apologetically",
+    "firm": "Speak calmly but firmly, no warmth",
+    "excited": "Speak with excitement and enthusiasm",
+    "calm": "Speak calmly and evenly",
+    "soft": "Speak softly and gently",
+}
+
+# Coach phrases → default TTS instruct for the next turn(s).
+_COACH_TTS_INSTRUCT_RE = re.compile(
+    r"\b(angry|angrier|anger|mad|friendly|friendlier|warm|warmer|"
+    r"apologetic|sorry|firm|firmer|cheerful|excited|excitedly|"
+    r"calm|calmer|soft|softer)\b",
+    re.IGNORECASE,
+)
+_COACH_TTS_INSTRUCT_MAP = {
+    "angry": "Speak angrily and firmly, clearly offended",
+    "angrier": "Speak angrily and firmly, clearly offended",
+    "anger": "Speak angrily and firmly, clearly offended",
+    "mad": "Speak angrily and firmly, clearly offended",
+    "friendly": "Speak warmly, friendly, and natural",
+    "friendlier": "Speak warmly, friendly, and natural",
+    "warm": "Speak warmly, friendly, and natural",
+    "warmer": "Speak warmly, friendly, and natural",
+    "apologetic": "Speak softly and apologetically",
+    "sorry": "Speak softly and apologetically",
+    "firm": "Speak calmly but firmly, no warmth",
+    "firmer": "Speak calmly but firmly, no warmth",
+    "cheerful": "Speak cheerfully with light energy",
+    "excited": "Speak with excitement and enthusiasm",
+    "excitedly": "Speak with excitement and enthusiasm",
+    "calm": "Speak calmly and evenly",
+    "calmer": "Speak calmly and evenly",
+    "soft": "Speak softly and gently",
+    "softer": "Speak softly and gently",
+}
 
 
 def _strip_wire_tokens(text: str) -> str:
@@ -120,6 +166,31 @@ def _strip_wire_tokens(text: str) -> str:
     while "\n\n\n" in cleaned:
         cleaned = cleaned.replace("\n\n\n", "\n\n")
     return cleaned.strip()
+
+
+def _extract_tts_instruct(text: str) -> tuple[str, str]:
+    """Return (spoken_text, instruct) from optional [[INSTRUCT:]] / [[EMO:]] tags."""
+    if not text:
+        return "", ""
+    instruct = ""
+    m = _INSTRUCT_TOKEN_RE.search(text)
+    if m:
+        instruct = (m.group(1) or "").strip()
+    else:
+        m = _EMO_TOKEN_RE.search(text)
+        if m:
+            alias = (m.group(1) or "").strip().lower()
+            instruct = _EMO_INSTRUCT_MAP.get(alias, "")
+            if not instruct and alias:
+                instruct = f"Speak in a {alias} tone"
+    return _strip_wire_tokens(text), instruct
+
+
+def _coach_note_to_tts_instruct(note: str) -> str:
+    m = _COACH_TTS_INSTRUCT_RE.search(note or "")
+    if not m:
+        return ""
+    return _COACH_TTS_INSTRUCT_MAP.get(m.group(1).lower(), "")
 
 
 def _split_sentences(text: str, min_chars: int = 40) -> list:
@@ -235,6 +306,11 @@ class ChatSession:
         self.operator_directives: list[str] = []
         # Sticky call facts (caller/company/job) — survive history truncation.
         self.call_facts: dict[str, str] = call_facts_svc.empty_facts()
+        # Default TTS delivery instruct (coach emotion / sticky until cleared).
+        self.default_tts_instruct: str = ""
+        # Active turn's TTS consumer (cancelled on barge-in with the LLM task).
+        self._tts_consumer_task = None
+        self._tts_queue: Optional[asyncio.Queue] = None
 
     @property
     def tts_turn(self):
@@ -346,14 +422,29 @@ def persist_chat_session(session: ChatSession):
 def cancel_active_turn(session: ChatSession) -> bool:
     """Stop in-flight LLM/TTS for this session (barge-in). Returns True if a turn was active."""
     task = session.active_turn_task
+    consumer = session._tts_consumer_task
+    q = session._tts_queue
+    cancelled = False
     if task and not task.done():
         session.generation_turn += 1
         task.cancel()
-        ft = session._filler_task
-        if ft and not ft.done():
-            ft.cancel()
-        return True
-    return False
+        cancelled = True
+    if consumer and not consumer.done():
+        consumer.cancel()
+        cancelled = True
+    if q is not None:
+        try:
+            while True:
+                q.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        session._tts_queue = None
+    session._tts_consumer_task = None
+    ft = session._filler_task
+    if ft and not ft.done():
+        ft.cancel()
+        cancelled = True
+    return cancelled
 
 
 def _quiet_filler_events(clip, gain: float):
@@ -776,6 +867,14 @@ async def ws_chat(ws: WebSocket):
                 note = (msg.get("text") or "").strip()
                 if note:
                     session.operator_directives.append(note)
+                    tts_instruct = _coach_note_to_tts_instruct(note)
+                    if tts_instruct:
+                        session.default_tts_instruct = tts_instruct
+                        logger.info(
+                            "[%s] Coach set default_tts_instruct=%r",
+                            session.id,
+                            tts_instruct,
+                        )
                     logger.info(
                         "[%s] Operator coach directive (%d): %s",
                         session.id,
@@ -786,6 +885,7 @@ async def ws_chat(ws: WebSocket):
                         {
                             "type": "coach_ack",
                             "count": len(session.operator_directives),
+                            "tts_instruct": session.default_tts_instruct or "",
                         }
                     )
                     if getattr(config, "ANTHROPIC_CACHE_WARMUP", True):
@@ -796,6 +896,22 @@ async def ws_chat(ws: WebSocket):
                                 session.get_model_params(),
                             )
                         )
+
+            # ------ tts_instruct (Operator / bridge sticky delivery) ------
+            elif msg_type == "tts_instruct":
+                instruct = (msg.get("text") or msg.get("instruct") or "").strip()
+                session.default_tts_instruct = instruct
+                logger.info(
+                    "[%s] default_tts_instruct=%r",
+                    session.id,
+                    instruct[:120] if instruct else "",
+                )
+                await send_event(
+                    {
+                        "type": "tts_instruct_ack",
+                        "instruct": session.default_tts_instruct,
+                    }
+                )
 
             # ------ call_facts / call_fact (Operator seed or mid-call pin) ------
             elif msg_type == "call_facts":
@@ -1199,47 +1315,57 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
     session.turn_snapshot = {"full_response": "", "sentence_buffer": ""}
 
     tts_queue: asyncio.Queue = asyncio.Queue()
+    session._tts_queue = tts_queue
 
     async def tts_consumer():
         nonlocal tts_sentence_count
-        while True:
-            sentence = await tts_queue.get()
-            if sentence is None:
-                return
-            if not session.tts_enabled or not turn_active(turn_id):
-                continue
+        try:
+            while True:
+                sentence = await tts_queue.get()
+                if sentence is None:
+                    return
+                if not session.tts_enabled or not turn_active(turn_id):
+                    continue
 
-            batch = [sentence]
-            ended = False
-            while not tts_queue.empty():
-                nxt = tts_queue.get_nowait()
-                if nxt is None:
-                    ended = True
-                    break
-                batch.append(nxt)
+                batch = [sentence]
+                ended = False
+                while not tts_queue.empty():
+                    nxt = tts_queue.get_nowait()
+                    if nxt is None:
+                        ended = True
+                        break
+                    batch.append(nxt)
 
-            tts_sentence_count += 1
-            if tts_sentence_count == 1:
-                session.reply_audio_started = True
-                ft = session._filler_task
-                if ft and not ft.done():
-                    ft.cancel()
-                await send({"type": "tts_start", "num_sentences": 1, "sample_rate": 24000})
+                tts_sentence_count += 1
+                if tts_sentence_count == 1:
+                    session.reply_audio_started = True
+                    ft = session._filler_task
+                    if ft and not ft.done():
+                        ft.cancel()
+                    await send({"type": "tts_start", "num_sentences": 1, "sample_rate": 24000})
 
-            spoken = _strip_wire_tokens(" ".join(batch))
-            if not spoken:
+                spoken, instruct = _extract_tts_instruct(" ".join(batch))
+                if not instruct:
+                    instruct = session.default_tts_instruct or ""
+                if not spoken:
+                    if ended:
+                        return
+                    continue
+
+                async with session.tts_lock:
+                    if turn_active(turn_id):
+                        await _dispatch_tts(
+                            ws, session, spoken, session.voice_id, session.language,
+                            turn_id, instruct=instruct,
+                        )
+
                 if ended:
                     return
-                continue
-
-            async with session.tts_lock:
-                if turn_active(turn_id):
-                    await _dispatch_tts(ws, session, spoken, session.voice_id, session.language, turn_id)
-
-            if ended:
-                return
+        except asyncio.CancelledError:
+            return
 
     consumer_task = asyncio.create_task(tts_consumer()) if session.tts_enabled else None
+    session._tts_consumer_task = consumer_task
 
     # Track whether route caused a restart
     route_switched = False
@@ -1331,7 +1457,9 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
         first_tts_dispatched = False
         session.turn_snapshot = {"full_response": "", "sentence_buffer": ""}
         tts_queue = asyncio.Queue()
+        session._tts_queue = tts_queue
         consumer_task = asyncio.create_task(tts_consumer()) if session.tts_enabled else None
+        session._tts_consumer_task = consumer_task
         t_first_token = None
 
         try:
@@ -1388,7 +1516,9 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
 
     await send({"type": "llm_done", "text": full_response})
 
-    session.conversation.add_assistant_message(full_response, model=session.model)
+    # Keep wire tokens in llm_done for AnswerBot; strip from history/TTS memory.
+    history_text = _strip_wire_tokens(full_response) or full_response
+    session.conversation.add_assistant_message(history_text, model=session.model)
     if full_response.strip():
         asst_updated = call_facts_svc.extract_from_assistant(
             full_response, session.call_facts
@@ -1441,17 +1571,40 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
 # ---------------------------------------------------------------------------
 # TTS dispatch
 # ---------------------------------------------------------------------------
-async def _dispatch_tts(ws: WebSocket, session: ChatSession, text: str, voice_id: str, language: str, turn_id: int):
+async def _dispatch_tts(
+    ws: WebSocket,
+    session: ChatSession,
+    text: str,
+    voice_id: str,
+    language: str,
+    turn_id: int,
+    instruct: str = "",
+):
     """Send one sentence to the TTS server and relay audio (caller holds tts_lock)."""
-    text = _strip_wire_tokens(text)
+    text, tag_instruct = _extract_tts_instruct(text)
+    instruct = (instruct or tag_instruct or session.default_tts_instruct or "").strip()
     if not text:
         return
+    if instruct:
+        logger.info("[%s] TTS instruct=%r text=%r", session.id, instruct[:80], text[:60])
     try:
-        async for event in stream_tts(
-            text,
-            voice_id=voice_id,
-            language=language,
-        ):
+        # Prefer instruct-capable client when delivery guidance is set; otherwise
+        # keep the pooled v2 client for lower reconnect latency.
+        if instruct:
+            stream = stream_tts_with_instruct(
+                text,
+                voice_id=voice_id,
+                language=language,
+                instruct=instruct,
+                turn_id=str(turn_id),
+            )
+        else:
+            stream = stream_tts_v2(
+                text,
+                voice_id=voice_id,
+                language=language,
+            )
+        async for event in stream:
             if session.generation_turn != turn_id:
                 return
             if isinstance(event, TTSInstability):

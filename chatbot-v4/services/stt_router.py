@@ -91,6 +91,7 @@ def get_stt_info(active_model: Optional[str] = None) -> dict:
         "active_model": model,
         "models": config.AVAILABLE_STT_MODELS,
         "realtime_delay": config.STT_REALTIME_DELAY,
+        "realtime_delay_options": ["minimal", "low", "medium", "high", "xhigh"],
         "language": config.STT_LANGUAGE,
         "streaming": is_realtime_model(model),
         "provider": _provider_for(model),

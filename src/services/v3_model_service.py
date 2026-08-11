@@ -51,12 +51,23 @@ class SentenceCache:
         self._misses = 0
 
     @staticmethod
-    def _key(text: str, voice_id: Optional[str], language: str) -> str:
-        raw = f"{text}|{voice_id or ''}|{language}"
+    def _key(
+        text: str,
+        voice_id: Optional[str],
+        language: str,
+        instruct: str = "",
+    ) -> str:
+        raw = f"{text}|{voice_id or ''}|{language}|{instruct or ''}"
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    def get(self, text: str, voice_id: Optional[str], language: str):
-        key = self._key(text, voice_id, language)
+    def get(
+        self,
+        text: str,
+        voice_id: Optional[str],
+        language: str,
+        instruct: str = "",
+    ):
+        key = self._key(text, voice_id, language, instruct)
         with self._lock:
             entry = self._data.get(key)
             if entry is None:
@@ -66,9 +77,16 @@ class SentenceCache:
             self._hits += 1
             return entry
 
-    def put(self, text: str, voice_id: Optional[str], language: str,
-            audio: np.ndarray, sr: int) -> None:
-        key = self._key(text, voice_id, language)
+    def put(
+        self,
+        text: str,
+        voice_id: Optional[str],
+        language: str,
+        audio: np.ndarray,
+        sr: int,
+        instruct: str = "",
+    ) -> None:
+        key = self._key(text, voice_id, language, instruct)
         size = audio.nbytes
         with self._lock:
             if key in self._data:
@@ -232,24 +250,34 @@ class V3ModelService:
         language: str,
         prompt: object,
         chunk_size: int = 8,
+        instruct: str = "",
     ) -> AsyncIterator[tuple[np.ndarray, int]]:
         """Bridge the sync streaming generator onto asyncio.
 
         Yields (audio_chunk float32 ndarray, sample_rate). Generation runs on
         the single GPU executor thread; abandoning this iterator (e.g. client
         disconnect) sets the cancel flag, stopping the producer at the next chunk.
+        Optional ``instruct`` is experimental on Base voice-clone.
         """
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue(maxsize=64)
         cancel = threading.Event()
         max_new_tokens = min(600, max(150, len(text) * 3))
+        instruct = (instruct or "").strip() or None
 
         def producer() -> None:
             try:
-                for chunk, sr, _timing in self.model.generate_voice_clone_streaming(
-                    text=text, language=language, voice_clone_prompt=prompt,
-                    chunk_size=chunk_size, max_new_tokens=max_new_tokens,
-                ):
+                kwargs = dict(
+                    text=text,
+                    language=language,
+                    voice_clone_prompt=prompt,
+                    chunk_size=chunk_size,
+                    max_new_tokens=max_new_tokens,
+                )
+                if instruct:
+                    kwargs["instruct"] = instruct
+                    logger.info("v3: applying instruct=%r for %r", instruct[:80], text[:40])
+                for chunk, sr, _timing in self.model.generate_voice_clone_streaming(**kwargs):
                     if cancel.is_set():
                         break
                     loop.call_soon_threadsafe(queue.put_nowait, (chunk, sr))

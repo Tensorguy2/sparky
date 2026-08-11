@@ -31,6 +31,11 @@ REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 # July 2026 models: use `languages` (array) instead of the legacy `language`.
 NEW_GEN_MODELS = frozenset({"gpt-transcribe", "gpt-live-transcribe"})
 
+# gpt-live-transcribe latency / accuracy tradeoff (OpenAI Realtime transcription).
+VALID_TRANSCRIPTION_DELAYS = frozenset({
+    "minimal", "low", "medium", "high", "xhigh",
+})
+
 
 def _require_api_key() -> None:
     if not config.OPENAI_API_KEY:
@@ -74,7 +79,11 @@ class RealtimeTranscriber:
     ):
         self.model = model
         self.language = language
-        self.delay = delay
+        d = (delay or "low").strip().lower()
+        if d not in VALID_TRANSCRIPTION_DELAYS:
+            logger.warning("Unknown transcription delay %r — using 'low'.", delay)
+            d = "low"
+        self.delay = d
         self.on_delta = on_delta
         self.on_vad_stopped = on_vad_stopped
         self.server_vad = server_vad
@@ -134,8 +143,14 @@ class RealtimeTranscriber:
             # New generation: `languages` array replaces `language`.
             if self.language:
                 transcription["languages"] = [self.language]
+            # Latency knob (minimal … xhigh). Only valid on gpt-live-transcribe;
+            # harmless if ignored on gpt-transcribe batch path (not used there).
+            if self.model == "gpt-live-transcribe":
+                transcription["delay"] = self.delay
         else:
             transcription["language"] = self.language
+        # Explicit commit via client VAD (AnswerBot owns endpointing).
+        # server_vad / vad_silence_ms reserved for a future opt-in path.
         payload = {
             "type": "session.update",
             "session": {

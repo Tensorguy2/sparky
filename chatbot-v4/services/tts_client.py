@@ -63,28 +63,37 @@ async def stream_tts(
     text: str,
     voice_id: str = "",
     language: str = "English",
+    instruct: str = "",
+    turn_id: str = "",
 ) -> AsyncGenerator[TTSEvent, None]:
     """
     Connect to the TTS server, synthesize text, and yield audio chunks.
 
     Each chunk contains raw PCM float32 LE bytes at 24 kHz mono.
     May yield TTSInstability when the fast server detects bad audio.
+    Optional ``instruct`` is natural-language delivery guidance for Qwen TTS.
     """
     voice_id = voice_id or config.DEFAULT_VOICE_ID
     url = config.TTS_WS_URL
+    instruct = (instruct or "").strip()
 
     logger.info(
-        "TTS request | voice=%s lang=%s text_len=%d url=%s",
-        voice_id, language, len(text), url,
+        "TTS request | voice=%s lang=%s text_len=%d instruct=%r url=%s",
+        voice_id, language, len(text), instruct[:80] if instruct else "", url,
     )
 
     try:
         async with websockets.connect(url, max_size=16 * 1024 * 1024) as ws:
-            await ws.send(json.dumps({
+            payload = {
                 "text": text,
                 "language": language,
                 "voice_id": voice_id,
-            }))
+            }
+            if instruct:
+                payload["instruct"] = instruct
+            if turn_id:
+                payload["turn_id"] = str(turn_id)
+            await ws.send(json.dumps(payload))
 
             sample_rate = 24000
             expecting_binary = False

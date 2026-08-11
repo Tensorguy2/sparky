@@ -284,6 +284,8 @@ async def ws_tts(ws: WebSocket) -> None:
     # Optional: groups the fragments of one reply so they can share a speaker.
     # Absent (e.g. the server-side TTS path) means no lock, i.e. prior behaviour.
     turn_id: Optional[str] = req.get("turn_id")
+    # Natural-language delivery (experimental on Base voice-clone).
+    instruct: str = (req.get("instruct") or "").strip()
 
     if not text:
         await _send_error(ws, conn_id, "'text' field is required")
@@ -309,8 +311,11 @@ async def ws_tts(ws: WebSocket) -> None:
         logger.info("[%s] speaker lock applied (turn=%s)", conn_id, turn_id)
 
     sentences = split_into_sentences(text)
-    logger.info("[%s] voice=%r lang=%s %d sentence(s) text=%r",
-                conn_id, voice_id, language, len(sentences), text[:80])
+    logger.info(
+        "[%s] voice=%r lang=%s instruct=%r %d sentence(s) text=%r",
+        conn_id, voice_id, language, instruct[:80] if instruct else "",
+        len(sentences), text[:80],
+    )
 
     await ws.send_text(json.dumps({
         "type": "metadata",
@@ -354,7 +359,9 @@ async def ws_tts(ws: WebSocket) -> None:
     for idx, sentence in enumerate(sentences):
         tag = f"[{conn_id}] [{idx + 1}/{len(sentences)}]"
 
-        cached = None if locked else v3_model_service.cache.get(sentence, voice_id, language)
+        cached = None if locked else v3_model_service.cache.get(
+            sentence, voice_id, language, instruct=instruct,
+        )
         if cached is not None:
             audio, sr = cached
             logger.info("%s CACHE HIT (%d samples)", tag, len(audio))
@@ -413,7 +420,7 @@ async def ws_tts(ws: WebSocket) -> None:
 
             try:
                 async for chunk, sr in v3_model_service.stream_sentence(
-                    gen_text, language, prompt,
+                    gen_text, language, prompt, instruct=instruct,
                 ):
                     if time.perf_counter() > deadline:
                         timed_out = True
@@ -513,6 +520,7 @@ async def ws_tts(ws: WebSocket) -> None:
                 if not locked:
                     v3_model_service.cache.put(
                         sentence, voice_id, language, spoken, sentence_sr,
+                        instruct=instruct,
                     )
                 # Pin the rest of this turn to the speaker just rendered. Built
                 # after the audio is already streaming, so it never delays what
