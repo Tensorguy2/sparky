@@ -123,6 +123,10 @@ TTS_SERVER_PORT = int(os.getenv("TTS_SERVER_PORT", "25568"))
 TTS_WS_URL: str = os.getenv("TTS_WS_URL", f"ws://{TTS_SERVER_HOST}:{TTS_SERVER_PORT}/ws/tts")
 TTS_REST_URL: str = os.getenv("TTS_REST_URL", f"http://{TTS_SERVER_HOST}:{TTS_SERVER_PORT}")
 DEFAULT_VOICE_ID = os.getenv("DEFAULT_VOICE_ID", "mikey")
+# When false: strip [[EMO:]]/[[INSTRUCT:]] from speech but never send instruct to TTS.
+TTS_INSTRUCT_ENABLED: bool = os.getenv("TTS_INSTRUCT_ENABLED", "false").lower() in (
+    "1", "true", "yes", "on",
+)
 
 # --- Router / flow -----------------------------------------------------------
 ROUTER_ENABLED = os.getenv("ROUTER_ENABLED", "true").lower() in ("1", "true", "yes")

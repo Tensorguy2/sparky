@@ -171,24 +171,31 @@ def _strip_wire_tokens(text: str) -> str:
 
 
 def _extract_tts_instruct(text: str) -> tuple[str, str]:
-    """Return (spoken_text, instruct) from optional [[INSTRUCT:]] / [[EMO:]] tags."""
+    """Return (spoken_text, instruct) from optional [[INSTRUCT:]] / [[EMO:]] tags.
+
+    Tags are always stripped from spoken text. Instruct is only returned when
+    ``TTS_INSTRUCT_ENABLED`` is on.
+    """
     if not text:
         return "", ""
     instruct = ""
-    m = _INSTRUCT_TOKEN_RE.search(text)
-    if m:
-        instruct = (m.group(1) or "").strip()
-    else:
-        m = _EMO_TOKEN_RE.search(text)
+    if getattr(config, "TTS_INSTRUCT_ENABLED", False):
+        m = _INSTRUCT_TOKEN_RE.search(text)
         if m:
-            alias = (m.group(1) or "").strip().lower()
-            instruct = _EMO_INSTRUCT_MAP.get(alias, "")
-            if not instruct and alias:
-                instruct = f"Speak in a {alias} tone"
+            instruct = (m.group(1) or "").strip()
+        else:
+            m = _EMO_TOKEN_RE.search(text)
+            if m:
+                alias = (m.group(1) or "").strip().lower()
+                instruct = _EMO_INSTRUCT_MAP.get(alias, "")
+                if not instruct and alias:
+                    instruct = f"Speak in a {alias} tone"
     return _strip_wire_tokens(text), instruct
 
 
 def _coach_note_to_tts_instruct(note: str) -> str:
+    if not getattr(config, "TTS_INSTRUCT_ENABLED", False):
+        return ""
     m = _COACH_TTS_INSTRUCT_RE.search(note or "")
     if not m:
         return ""
@@ -983,12 +990,17 @@ async def ws_chat(ws: WebSocket):
             # ------ tts_instruct (Operator / bridge sticky delivery) ------
             elif msg_type == "tts_instruct":
                 instruct = (msg.get("text") or msg.get("instruct") or "").strip()
-                session.default_tts_instruct = instruct
-                logger.info(
-                    "[%s] default_tts_instruct=%r",
-                    session.id,
-                    instruct[:120] if instruct else "",
-                )
+                if not getattr(config, "TTS_INSTRUCT_ENABLED", False):
+                    instruct = ""
+                    session.default_tts_instruct = ""
+                    logger.info("[%s] tts_instruct ignored (TTS_INSTRUCT_ENABLED=false)", session.id)
+                else:
+                    session.default_tts_instruct = instruct
+                    logger.info(
+                        "[%s] default_tts_instruct=%r",
+                        session.id,
+                        instruct[:120] if instruct else "",
+                    )
                 await send_event(
                     {
                         "type": "tts_instruct_ack",
@@ -1598,8 +1610,11 @@ async def handle_user_text(
                     await send({"type": "tts_start", "num_sentences": 1, "sample_rate": 24000})
 
                 spoken, instruct = _extract_tts_instruct(" ".join(batch))
-                if not instruct:
-                    instruct = session.default_tts_instruct or ""
+                if getattr(config, "TTS_INSTRUCT_ENABLED", False):
+                    if not instruct:
+                        instruct = session.default_tts_instruct or ""
+                else:
+                    instruct = ""
                 if not spoken:
                     if ended:
                         return
@@ -1862,7 +1877,10 @@ async def _dispatch_tts(
 ):
     """Send one sentence to the TTS server and relay audio (caller holds tts_lock)."""
     text, tag_instruct = _extract_tts_instruct(text)
-    instruct = (instruct or tag_instruct or session.default_tts_instruct or "").strip()
+    if getattr(config, "TTS_INSTRUCT_ENABLED", False):
+        instruct = (instruct or tag_instruct or session.default_tts_instruct or "").strip()
+    else:
+        instruct = ""
     if not text:
         return
     if instruct:
