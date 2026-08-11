@@ -144,21 +144,38 @@ def _cache_control_block() -> dict[str, str]:
     return block
 
 
-def _anthropic_system(system_prompt: str) -> Union[str, List[dict[str, Any]]]:
-    """Wrap system prompt with prompt-cache breakpoint when enabled."""
-    text = system_prompt or ""
-    if (
-        not getattr(config, "ANTHROPIC_PROMPT_CACHE", True)
-        or len(text) < _CACHE_MIN_CHARS
-    ):
-        return text
-    return [
+def _anthropic_system(
+    system_prompt: str,
+    *,
+    dynamic_suffix: str = "",
+) -> Union[str, List[dict[str, Any]]]:
+    """Wrap system prompt with prompt-cache breakpoint when enabled.
+
+    When ``dynamic_suffix`` is provided (coach / call_facts), only the static
+    prefix is cached so Operator coaching does not bust the pack cache.
+    """
+    static = system_prompt or ""
+    dynamic = (dynamic_suffix or "").strip()
+    if not getattr(config, "ANTHROPIC_PROMPT_CACHE", True):
+        if static and dynamic:
+            return f"{static}\n\n{dynamic}"
+        return static or dynamic
+    # Tiny prompts: no cache_control.
+    if len(static) < _CACHE_MIN_CHARS and not dynamic:
+        return static
+    if len(static) < _CACHE_MIN_CHARS:
+        # Nothing worth caching — send combined plain text.
+        return f"{static}\n\n{dynamic}".strip() if dynamic else static
+    blocks: List[dict[str, Any]] = [
         {
             "type": "text",
-            "text": text,
+            "text": static,
             "cache_control": _cache_control_block(),
         }
     ]
+    if dynamic:
+        blocks.append({"type": "text", "text": dynamic})
+    return blocks
 
 
 def _log_cache_usage(usage: Any, *, model: str, kind: str) -> None:
@@ -231,13 +248,20 @@ async def _stream_provider(
     system_prompt: str,
     messages: List[dict],
     params: ModelParams,
+    *,
+    dynamic_system: str = "",
 ) -> AsyncGenerator[str, None]:
     provider = config.provider_for_model(model)
     if provider == "openai":
-        async for token in _stream_openai(model, system_prompt, messages, params):
+        combined = system_prompt
+        if dynamic_system:
+            combined = f"{system_prompt}\n\n{dynamic_system}" if system_prompt else dynamic_system
+        async for token in _stream_openai(model, combined, messages, params):
             yield token
     elif provider == "anthropic":
-        async for token in _stream_anthropic(model, system_prompt, messages, params):
+        async for token in _stream_anthropic(
+            model, system_prompt, messages, params, dynamic_suffix=dynamic_system,
+        ):
             yield token
     else:
         raise ValueError(f"Unsupported provider: {provider}")
@@ -248,6 +272,8 @@ async def stream_chat(
     system_prompt: str,
     messages: List[dict],
     params: ModelParams | None = None,
+    *,
+    dynamic_system: str = "",
 ) -> AsyncGenerator[str, None]:
     """
     Stream LLM response tokens.
@@ -258,9 +284,10 @@ async def stream_chat(
 
     Args:
         model: Model ID (e.g. "gpt-4o", "claude-sonnet-4-20250514")
-        system_prompt: The full system prompt (instructions + context)
+        system_prompt: Static system prefix (pack) — Anthropic-cached when large
         messages: Conversation history as [{"role": ..., "content": ...}]
         params: Temperature and max_tokens overrides
+        dynamic_system: Uncached suffix (coach / call_facts)
 
     Yields:
         Individual text tokens/chunks as they arrive.
@@ -275,7 +302,7 @@ async def stream_chat(
         produced = False
         try:
             async for token in _stream_provider(
-                candidate, system_prompt, messages, p
+                candidate, system_prompt, messages, p, dynamic_system=dynamic_system,
             ):
                 if not produced:
                     produced = True
@@ -454,9 +481,11 @@ async def _stream_anthropic(
     system_prompt: str,
     messages: List[dict],
     params: ModelParams,
+    *,
+    dynamic_suffix: str = "",
 ) -> AsyncGenerator[str, None]:
     client = _get_anthropic()
-    system = _anthropic_system(system_prompt)
+    system = _anthropic_system(system_prompt, dynamic_suffix=dynamic_suffix)
     cached = isinstance(system, list)
 
     logger.info(

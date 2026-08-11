@@ -264,46 +264,85 @@ async def _send_error(ws: WebSocket, conn_id: str, message: str) -> None:
 
 @app.websocket("/ws/tts")
 async def ws_tts(ws: WebSocket) -> None:
+    """Multi-request TTS socket: synthesize → done → wait for next (no close)."""
     conn_id = uuid.uuid4().hex[:8]
-    t_connect = time.perf_counter()
     await ws.accept()
+    logger.info("[%s] TTS WS connected (multi-request)", conn_id)
 
-    try:
-        raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
-        req: dict = json.loads(raw)
-    except asyncio.TimeoutError:
-        await _send_error(ws, conn_id, "Request timed out (10 s)")
-        return
-    except Exception as exc:
-        await _send_error(ws, conn_id, f"Invalid JSON: {exc}")
-        return
+    while True:
+        try:
+            raw = await asyncio.wait_for(ws.receive_text(), timeout=300.0)
+        except asyncio.TimeoutError:
+            logger.info("[%s] TTS WS idle timeout — closing", conn_id)
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            return
+        except WebSocketDisconnect:
+            logger.info("[%s] TTS WS client disconnect", conn_id)
+            return
+        except Exception as exc:
+            await _send_error(ws, conn_id, f"Receive error: {exc}")
+            return
+
+        try:
+            req: dict = json.loads(raw)
+        except Exception as exc:
+            await _send_error(ws, conn_id, f"Invalid JSON: {exc}")
+            return
+
+        if req.get("type") == "close":
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            return
+        if req.get("type") == "ping":
+            try:
+                await ws.send_text(json.dumps({"type": "pong"}))
+            except Exception:
+                return
+            continue
+
+        closed = await _tts_one_utterance(ws, conn_id, req)
+        if closed:
+            return
+
+
+async def _tts_one_utterance(ws: WebSocket, conn_id: str, req: dict) -> bool:
+    """Synthesize one request; return True if the socket should be abandoned."""
+    t_connect = time.perf_counter()
 
     text: str = req.get("text", "").strip()
     language: str = req.get("language", "English")
     voice_id: Optional[str] = req.get("voice_id")
-    # Optional: groups the fragments of one reply so they can share a speaker.
-    # Absent (e.g. the server-side TTS path) means no lock, i.e. prior behaviour.
     turn_id: Optional[str] = req.get("turn_id")
-    # Natural-language delivery (experimental on Base voice-clone).
     instruct: str = (req.get("instruct") or "").strip()
 
     if not text:
-        await _send_error(ws, conn_id, "'text' field is required")
-        return
+        try:
+            await ws.send_text(json.dumps({"type": "error", "message": "'text' field is required"}))
+            await ws.send_text(json.dumps({"type": "done"}))
+        except Exception:
+            return True
+        return False
 
     prompt = None
     if voice_id:
         entry = v3_model_service.voices.get(voice_id)
         if entry is None:
-            await _send_error(
-                ws, conn_id,
-                f"Voice '{voice_id}' not found. Available: {list(v3_model_service.voices)}",
-            )
-            return
+            try:
+                await ws.send_text(json.dumps({
+                    "type": "error",
+                    "message": f"Voice '{voice_id}' not found. Available: {list(v3_model_service.voices)}",
+                }))
+                await ws.send_text(json.dumps({"type": "done"}))
+            except Exception:
+                return True
+            return False
         prompt = entry.prompt
 
-    # A lock already exists once an earlier fragment of this turn has been
-    # spoken; later fragments inherit the speaker it actually produced.
     lock_key = (voice_id, turn_id) if (_SPEAKER_LOCK and voice_id and turn_id) else None
     locked_prompt = _lock_get(lock_key) if lock_key else None
     if locked_prompt is not None:
@@ -336,7 +375,6 @@ async def ws_tts(ws: WebSocket) -> None:
             await ws.send_text(json.dumps({
                 "type": "sample_rate_correction", "sample_rate": sr,
             }))
-        # Hard safety: nothing above full-scale leaves the server.
         audio = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
         pcm = audio.tobytes()
         await ws.send_text(json.dumps({
@@ -350,10 +388,6 @@ async def ws_tts(ws: WebSocket) -> None:
         if t_first_audio is None:
             t_first_audio = time.perf_counter() - t_connect
 
-    # Once a speaker is locked, cached audio cannot be served: it was rendered
-    # under different conditioning, so replaying it is exactly the mid-reply
-    # voice change the lock exists to prevent. Only unlocked (first) sentences
-    # use the cache, which is where the repeated greetings and fillers live.
     locked = locked_prompt is not None
 
     for idx, sentence in enumerate(sentences):
@@ -368,10 +402,7 @@ async def ws_tts(ws: WebSocket) -> None:
             try:
                 await send_chunk(idx, audio, sr)
             except Exception:
-                return
-            # Lock to the cached audio as well. It is what the listener just
-            # heard, so the rest of the turn has to match it -- and a repeated
-            # greeting is the most likely first sentence to be a cache hit.
+                return True
             if lock_key and not locked:
                 carry = await v3_model_service.build_carryover_prompt(audio, sr, sentence)
                 if carry is not None:
@@ -381,22 +412,14 @@ async def ws_tts(ws: WebSocket) -> None:
                     logger.info("%s speaker locked from cache for turn=%s", tag, turn_id)
             continue
 
-        # Text ending mid-clause truncates far more often -- "Here is the answer"
-        # came back at 0.16 s every time, where the same text with a period was
-        # fine. Cheaper to terminate it than to retry the take.
         gen_text = sentence
         if _DURATION_GUARD and needs_terminal_punctuation(sentence):
             gen_text = sentence.rstrip() + "."
 
-        # Audio is withheld until this much has accumulated, at which point the
-        # take is too long to be a truncation and streaming proceeds live. The
-        # opening slices normally clear it immediately, so the common path pays
-        # nothing.
-        gate_s = min(expected_min_seconds(sentence), _GUARD_CAP_S) if _DURATION_GUARD else 0.0
+        # TTFA: stream from the first chunk. Hold/retry only before any emit.
+        # Truncation retries that withhold audio caused ~3s TTFA outliers.
+        gate_s = 0.0
 
-        # Longest take seen for this sentence. If every attempt is rejected the
-        # words still have to be spoken, so the best one is played rather than
-        # dropping the fragment and leaving a hole in the reply.
         best_take: List[np.ndarray] = []
         best_take_s = 0.0
 
@@ -430,14 +453,11 @@ async def ws_tts(ws: WebSocket) -> None:
                     reason = _is_unstable(chunk)
                     if reason:
                         unstable_reason = reason
-                        # Mute this slice so the blast never plays; keep timeline.
-                        # Nothing is emitted while still holding, since a retry
-                        # will replace the whole sentence.
                         if flushed:
                             try:
                                 await send_chunk(idx, np.zeros_like(chunk), sr)
                             except Exception:
-                                return
+                                return True
                         break
                     sentence_sr = sr
                     sentence_chunks.append(chunk)
@@ -450,8 +470,6 @@ async def ws_tts(ws: WebSocket) -> None:
                             await flush_held(sr)
 
                 if not timed_out and not unstable_reason and not flushed:
-                    # Generation ended with everything still held, so the take is
-                    # shorter than the text can account for.
                     unstable_reason = check_duration(sentence, held_s)
                     if not unstable_reason:
                         await flush_held(sentence_sr)
@@ -459,18 +477,16 @@ async def ws_tts(ws: WebSocket) -> None:
                         best_take, best_take_s = list(held), held_s
             except WebSocketDisconnect:
                 logger.info("[%s] client disconnected at sentence %d", conn_id, idx)
-                return
+                return True
             except Exception as exc:
                 logger.exception("[%s] inference error at sentence %d", conn_id, idx)
                 global _error_count
                 with _metrics_lock:
                     _error_count += 1
                 await _send_error(ws, conn_id, f"Inference error on chunk {idx}: {exc}")
-                return
+                return True
 
             if timed_out or unstable_reason:
-                # Anti-stutter: only restart if the listener has not already
-                # heard good audio from this sentence.
                 already_streamed = flushed
                 reason = "timeout" if timed_out else unstable_reason
                 budget = _MAX_RETRIES + (
@@ -496,13 +512,10 @@ async def ws_tts(ws: WebSocket) -> None:
                         "will_retry": will_retry,
                     }))
                 except Exception:
-                    return
+                    return True
                 if will_retry:
                     await asyncio.sleep(0.1)
                     continue
-                # Out of retries. Play the longest take rather than nothing, so
-                # the reply never loses words; a short take is still better than
-                # a silent gap.
                 if not flushed:
                     if held_s >= best_take_s:
                         best_take, best_take_s = list(held), held_s
@@ -522,9 +535,6 @@ async def ws_tts(ws: WebSocket) -> None:
                         sentence, voice_id, language, spoken, sentence_sr,
                         instruct=instruct,
                     )
-                # Pin the rest of this turn to the speaker just rendered. Built
-                # after the audio is already streaming, so it never delays what
-                # the caller hears.
                 if lock_key and not locked:
                     carry = await v3_model_service.build_carryover_prompt(
                         spoken, sentence_sr, sentence,
@@ -536,11 +546,10 @@ async def ws_tts(ws: WebSocket) -> None:
                         logger.info("%s speaker locked for turn=%s", tag, turn_id)
             break
 
-    await ws.send_text(json.dumps({"type": "done"}))
     try:
-        await ws.close()
+        await ws.send_text(json.dumps({"type": "done"}))
     except Exception:
-        pass
+        return True
 
     wall = time.perf_counter() - t_connect
     rtf = wall / total_audio_s if total_audio_s else 0
@@ -548,6 +557,7 @@ async def ws_tts(ws: WebSocket) -> None:
     _record(ttfa, rtf)
     logger.info("[%s] v3 Done | wall=%.2f s audio=%.2f s RTF=%.3f TTFA=%.3f s",
                 conn_id, wall, total_audio_s, rtf, ttfa)
+    return False
 
 
 if __name__ == "__main__":

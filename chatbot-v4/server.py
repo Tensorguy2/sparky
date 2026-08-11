@@ -55,12 +55,14 @@ from services.stt_router import (
 from services.stt_service import AudioRecorder, preload
 from services.tts_client_v2 import (
     EXCUSE_ME_PHRASE,
-    TTSInstability,
     reset_tts_server,
     shutdown_v2_client,
-    stream_tts_v2,
 )
-from services.tts_client import stream_tts as stream_tts_with_instruct
+from services.tts_client import (
+    TTSInstability,
+    stream_tts,
+    shutdown_v2_client as shutdown_pooled_tts,
+)
 from services import filler_cache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -207,18 +209,43 @@ def _split_sentences(text: str, min_chars: int = 40) -> list:
     return merged
 
 
-def _split_first_clause(text: str, min_chars: int = 20) -> list:
+def _split_first_clause(text: str, min_chars: int = 12) -> list:
+    """Flush first spoken clause early; terminal .!? flushes even if short."""
     raw = _CLAUSE_RE.split(text)
     merged = []
     buf = ""
     for part in raw:
         buf += (" " if buf else "") + part
-        if len(buf) >= min_chars:
+        stripped = buf.rstrip()
+        if stripped and stripped[-1] in ".!?…":
+            merged.append(buf)
+            buf = ""
+        elif len(buf) >= min_chars:
             merged.append(buf)
             buf = ""
     if buf:
         merged.append(buf)
     return merged
+
+
+def _norm_transcript(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _transcripts_match(a: str, b: str) -> bool:
+    """True when speculative and final STT are close enough to reuse the soft turn."""
+    na, nb = _norm_transcript(a), _norm_transcript(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if longer.startswith(shorter) and len(shorter) >= max(8, int(0.7 * len(longer))):
+        return True
+    wa, wb = set(na.split()), set(nb.split())
+    if not wa or not wb:
+        return False
+    return (len(wa & wb) / max(len(wa), len(wb))) >= 0.85
 
 
 def _operator_override_block(directives: list[str]) -> str:
@@ -311,6 +338,16 @@ class ChatSession:
         # Active turn's TTS consumer (cancelled on barge-in with the LLM task).
         self._tts_consumer_task = None
         self._tts_queue: Optional[asyncio.Queue] = None
+        # Hangover speculate: soft LLM before stop_stt; TTS gated until commit.
+        self.tts_release = asyncio.Event()
+        self.tts_release.set()
+        self.speculate_active: bool = False
+        self.speculate_transcript: str = ""
+        self.speculate_pcm_bytes: int = 0
+        self.speculate_seq: int = 0
+        self._speculate_stt_task: Optional[asyncio.Task] = None
+        self._speculate_user_pending: str = ""
+        self._turn_lock = asyncio.Lock()
 
     @property
     def tts_turn(self):
@@ -369,7 +406,8 @@ class ChatSession:
         st = flow.state(self.current_state) if flow else None
         return st.label if st and hasattr(st, "label") else (self.current_state or "default")
 
-    def build_system_prompt(self) -> str:
+    def build_static_system_prompt(self) -> str:
+        """Pack instruction + context only (stable Anthropic cache prefix)."""
         parts = []
         ctx = context_mgr.get(self.context_name) if context_mgr and self.context_name else None
         iset = instruction_mgr.get(self.instruction_set_id) if instruction_mgr and self.instruction_set_id else None
@@ -378,30 +416,45 @@ class ChatSession:
             instr = iset.system_prompt or ""
         elif iset and isinstance(iset, str):
             instr = iset
-        # Operator live directives must lead; they are prepended to instruction
-        # and often also pinned at the top of context.
-        directives_first = (instr or "").lstrip().startswith(
-            "# Operator directives (IMPERATIVE"
-        ) or (isinstance(ctx, str) and ctx.lstrip().startswith("# Operator directives (IMPERATIVE"))
-        if directives_first:
-            if instr:
-                parts.append(instr)
-            if ctx:
-                parts.append(ctx)
-        else:
-            if ctx:
-                parts.append(ctx)
-            if instr:
-                parts.append(instr)
-        prompt = "\n\n".join(parts) if parts else ""
+
+        def _strip_leading_coach(s: str) -> str:
+            if not s:
+                return ""
+            marker = "# Operator directives (IMPERATIVE"
+            if not s.lstrip().startswith(marker):
+                return s
+            rest = s.lstrip()
+            idx = rest.find("\n\n#")
+            if idx > 0:
+                return rest[idx + 2 :].lstrip()
+            idx = rest.find("\n\n")
+            return rest[idx:].lstrip() if idx > 0 else ""
+
+        instr = _strip_leading_coach(instr)
+        ctx_s = _strip_leading_coach(ctx) if isinstance(ctx, str) else (ctx or "")
+        if ctx_s:
+            parts.append(ctx_s)
+        if instr:
+            parts.append(instr)
+        return "\n\n".join(parts) if parts else ""
+
+    def build_dynamic_system_suffix(self) -> str:
+        """Coach + call_facts — must NOT sit inside the Anthropic cache block."""
+        parts = []
         facts_block = call_facts_svc.call_facts_block(self.call_facts)
         if facts_block:
-            prompt = f"{prompt}\n\n{facts_block}" if prompt else facts_block
-        # Sticky live coach: also pin at the END so it wins over long packs/history.
+            parts.append(facts_block)
         overlay = _operator_override_block(self.operator_directives)
         if overlay:
-            prompt = f"{prompt}\n\n{overlay}" if prompt else overlay
-        return prompt
+            parts.append(overlay)
+        return "\n\n".join(parts)
+
+    def build_system_prompt(self) -> str:
+        static = self.build_static_system_prompt()
+        dynamic = self.build_dynamic_system_suffix()
+        if static and dynamic:
+            return f"{static}\n\n{dynamic}"
+        return static or dynamic or ""
 
     def get_model_params(self) -> ModelParams:
         if instruction_mgr:
@@ -417,6 +470,21 @@ class ChatSession:
 def persist_chat_session(session: ChatSession):
     if session_store and session.persist_id:
         session_store.save(session.to_snapshot())
+
+
+def _clear_speculate_state(session: ChatSession, *, bump_seq: bool = True) -> None:
+    """Drop hangover soft-turn bookkeeping (does not cancel the LLM task)."""
+    if bump_seq:
+        session.speculate_seq += 1
+    session.speculate_active = False
+    session.speculate_transcript = ""
+    session.speculate_pcm_bytes = 0
+    session._speculate_user_pending = ""
+    stt_task = session._speculate_stt_task
+    session._speculate_stt_task = None
+    if stt_task and not stt_task.done():
+        stt_task.cancel()
+    session.tts_release.set()
 
 
 def cancel_active_turn(session: ChatSession) -> bool:
@@ -444,6 +512,11 @@ def cancel_active_turn(session: ChatSession) -> bool:
     if ft and not ft.done():
         ft.cancel()
         cancelled = True
+    if session.speculate_active or session._speculate_stt_task:
+        _clear_speculate_state(session)
+        cancelled = True
+    else:
+        session.tts_release.set()
     return cancelled
 
 
@@ -518,16 +591,25 @@ def _close_stt_stream(session: ChatSession):
 # ---------------------------------------------------------------------------
 # Turn management
 # ---------------------------------------------------------------------------
-async def start_user_turn(session: ChatSession, ws: WebSocket, text: str):
+async def start_user_turn(
+    session: ChatSession,
+    ws: WebSocket,
+    text: str,
+    *,
+    speculative: bool = False,
+):
     """Spawn one chat turn as a background task (non-blocking).
 
     The WS message loop keeps reading while the turn runs, so interrupt /
     start_stt messages cancel mid-turn via cancel_active_turn().
+    speculative=True: hangover soft turn — TTS held until stop_stt commits.
     """
     if session.active_turn_task and not session.active_turn_task.done():
         cancel_active_turn(session)
 
-    task = asyncio.create_task(handle_user_text(session, ws, text))
+    task = asyncio.create_task(
+        handle_user_text(session, ws, text, speculative=speculative)
+    )
     session.active_turn_task = task
 
     def _on_done(t):
@@ -587,6 +669,7 @@ async def lifespan(app):
 
     logger.info("=== Voice Chatbot v4 shutting down ===")
     await shutdown_v2_client()
+    await shutdown_pooled_tts()
 
 
 # ---------------------------------------------------------------------------
@@ -857,7 +940,7 @@ async def ws_chat(ws: WebSocket):
                     asyncio.create_task(
                         llm_service.warm_prompt_cache(
                             session.model,
-                            session.build_system_prompt(),
+                            session.build_static_system_prompt(),
                             session.get_model_params(),
                         )
                     )
@@ -892,7 +975,7 @@ async def ws_chat(ws: WebSocket):
                         asyncio.create_task(
                             llm_service.warm_prompt_cache(
                                 session.model,
-                                session.build_system_prompt(),
+                                session.build_static_system_prompt(),
                                 session.get_model_params(),
                             )
                         )
@@ -931,7 +1014,7 @@ async def ws_chat(ws: WebSocket):
                     asyncio.create_task(
                         llm_service.warm_prompt_cache(
                             session.model,
-                            session.build_system_prompt(),
+                            session.build_static_system_prompt(),
                             session.get_model_params(),
                         )
                     )
@@ -971,6 +1054,68 @@ async def ws_chat(ws: WebSocket):
             # ------ excuse_me ------
             elif msg_type == "excuse_me":
                 await _handle_excuse_me(session, ws, send_event)
+
+            # ------ speculate_stt (hangover soft STT+LLM; no finish()) ------
+            elif msg_type == "speculate_stt":
+                if session.stt_transcribing or not session.recorder.active:
+                    continue
+                chunks = session.recorder.snapshot()
+                if not chunks:
+                    continue
+                session.speculate_seq += 1
+                seq = session.speculate_seq
+                session.speculate_pcm_bytes = sum(len(c) for c in chunks)
+                prev = session._speculate_stt_task
+                if prev and not prev.done():
+                    prev.cancel()
+
+                async def _speculate_pipeline(seq: int = seq, chunks=chunks):
+                    try:
+                        stt_model = resolve_stt_model(session.stt_model)
+                        t0 = time.perf_counter()
+                        transcript = await transcribe(
+                            chunks,
+                            model_id=stt_model,
+                            language=config.STT_LANGUAGE,
+                            sample_rate=config.MIC_SAMPLE_RATE,
+                        )
+                        if seq != session.speculate_seq:
+                            return
+                        text = (transcript or "").strip()
+                        logger.info(
+                            "[%s] Speculate STT in %.0f ms: %r",
+                            session.id,
+                            (time.perf_counter() - t0) * 1000,
+                            text[:80],
+                        )
+                        if not text:
+                            return
+                        session.speculate_transcript = text
+                        async with session._turn_lock:
+                            if seq != session.speculate_seq:
+                                return
+                            # stop_stt already owns a committed turn — do not clobber.
+                            if session.active_turn_task and not session.active_turn_task.done():
+                                return
+                            if not session.recorder.active and session.tts_release.is_set():
+                                return
+                            await start_user_turn(
+                                session, ws, text, speculative=True
+                            )
+                    except asyncio.CancelledError:
+                        return
+                    except Exception:
+                        logger.exception("[%s] Speculate pipeline failed", session.id)
+
+                session._speculate_stt_task = asyncio.create_task(_speculate_pipeline())
+                logger.info("[%s] Speculate STT armed (%d bytes)", session.id, session.speculate_pcm_bytes)
+
+            # ------ speculate_cancel (speech resumed during hangover) ------
+            elif msg_type == "speculate_cancel":
+                if session.speculate_active or session._speculate_stt_task:
+                    logger.info("[%s] Speculate cancelled (speech continued)", session.id)
+                if cancel_active_turn(session):
+                    await send_event({"type": "turn_cancelled"})
 
             # ------ start_stt ------
             elif msg_type == "start_stt":
@@ -1044,7 +1189,7 @@ async def ws_chat(ws: WebSocket):
 
                 session.stt_transcribing = True
 
-                # === v4: NON-BLOCKING STT ===
+                # === v4: NON-BLOCKING STT (reuse hangover speculate when possible) ===
                 t_stt_start = time.perf_counter()
 
                 if session.stt_stream:
@@ -1053,13 +1198,35 @@ async def ws_chat(ws: WebSocket):
                     vad_did_commit = session.vad_committed.is_set()
                     transcript = await stream.finish(already_committed=vad_did_commit)
                 else:
-                    await send_event({"type": "transcript_delta", "delta": "Transcribing\u2026"})
-                    transcript = await transcribe(
-                        chunks,
-                        model_id=stt_model,
-                        language=config.STT_LANGUAGE,
-                        sample_rate=config.MIC_SAMPLE_RATE,
-                    )
+                    # Await in-flight hangover STT so we don't double-queue Parakeet.
+                    spec_task = session._speculate_stt_task
+                    if spec_task and not spec_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(spec_task), timeout=0.9)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            pass
+                    total_bytes = sum(len(c) for c in chunks)
+                    new_bytes = max(0, total_bytes - int(session.speculate_pcm_bytes or 0))
+                    # ~120ms of new PCM @ 24 kHz mono int16 ≈ hangover silence.
+                    silence_budget = int(config.MIC_SAMPLE_RATE * 2 * 0.12)
+                    if (
+                        session.speculate_transcript
+                        and new_bytes <= silence_budget
+                    ):
+                        transcript = session.speculate_transcript
+                        logger.info(
+                            "[%s] Speculate STT reused (new_pcm=%d bytes)",
+                            session.id,
+                            new_bytes,
+                        )
+                    else:
+                        await send_event({"type": "transcript_delta", "delta": "Transcribing\u2026"})
+                        transcript = await transcribe(
+                            chunks,
+                            model_id=stt_model,
+                            language=config.STT_LANGUAGE,
+                            sample_rate=config.MIC_SAMPLE_RATE,
+                        )
 
                 stt_ms = (time.perf_counter() - t_stt_start) * 1000
                 logger.info("[%s] STT completed in %.0f ms", session.id, stt_ms)
@@ -1069,13 +1236,61 @@ async def ws_chat(ws: WebSocket):
                     session.stt_transcribing = False
                     await send_event({"type": "stt_stopped"})
 
+                    # Soft turn may still be arming after reused STT (wait unlocked).
+                    if (
+                        session.speculate_transcript
+                        and _transcripts_match(
+                            session.speculate_transcript, transcript
+                        )
+                    ):
+                        for _ in range(25):
+                            if (
+                                session.speculate_active
+                                and session.active_turn_task
+                                and not session.active_turn_task.done()
+                            ):
+                                break
+                            await asyncio.sleep(0.01)
+
+                    async with session._turn_lock:
+                        soft = (
+                            session.speculate_active
+                            and session.active_turn_task
+                            and not session.active_turn_task.done()
+                            and _transcripts_match(
+                                session.speculate_transcript, transcript
+                            )
+                        )
+                        if soft:
+                            pending = session._speculate_user_pending or transcript
+                            session.conversation.add_or_coalesce_user_message(transcript)
+                            updated = call_facts_svc.extract_from_user(
+                                transcript, session.call_facts
+                            )
+                            if updated:
+                                call_facts_svc.log_updates(
+                                    session.id, updated, session.call_facts
+                                )
+                            session.speculate_active = False
+                            session._speculate_user_pending = ""
+                            session.tts_release.set()
+                            logger.info(
+                                "[%s] Speculate HIT — soft turn released (pending=%r)",
+                                session.id,
+                                (pending or "")[:60],
+                            )
+                        else:
+                            if cancel_active_turn(session):
+                                await send_event({"type": "turn_cancelled"})
+                                if session.speculate_transcript:
+                                    logger.info(
+                                        "[%s] Speculate MISS — restarting turn",
+                                        session.id,
+                                    )
+                            await start_user_turn(session, ws, transcript)
+                else:
                     if cancel_active_turn(session):
                         await send_event({"type": "turn_cancelled"})
-
-                    # Fillers are delay-gated inside handle_user_text (only if
-                    # reply TTS is late), not fired immediately after STT.
-                    await start_user_turn(session, ws, transcript)
-                else:
                     await send_event({"type": "error", "message": "No speech detected. Try speaking longer or closer to the mic."})
                     session.stt_transcribing = False
                     await send_event({"type": "stt_stopped"})
@@ -1244,7 +1459,13 @@ async def maybe_route(session: ChatSession, send) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # handle_user_text (v4: parallel router + stage timers)
 # ---------------------------------------------------------------------------
-async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
+async def handle_user_text(
+    session: ChatSession,
+    ws: WebSocket,
+    text: str,
+    *,
+    speculative: bool = False,
+):
     """Process a user utterance: routing -> LLM generation -> TTS -> audio stream.
 
     v4 changes:
@@ -1252,14 +1473,28 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
       - maybe_route runs in parallel; if a switch occurs, the current generation
         is cancelled and restarted with the new state's prompt (single restart)
       - Stage timers are logged
+      - speculative hangover turns hold TTS until stop_stt commits
     """
     sid = session.id
-    logger.info("[%s] User: %s", sid, text[:100])
+    logger.info(
+        "[%s] User%s: %s",
+        sid,
+        " (speculate)" if speculative else "",
+        text[:100],
+    )
 
-    session.conversation.add_or_coalesce_user_message(text)
-    updated = call_facts_svc.extract_from_user(text, session.call_facts)
-    if updated:
-        call_facts_svc.log_updates(sid, updated, session.call_facts)
+    if speculative:
+        session.speculate_active = True
+        session._speculate_user_pending = text
+        session.tts_release.clear()
+    else:
+        session.speculate_active = False
+        session._speculate_user_pending = ""
+        session.tts_release.set()
+        session.conversation.add_or_coalesce_user_message(text)
+        updated = call_facts_svc.extract_from_user(text, session.call_facts)
+        if updated:
+            call_facts_svc.log_updates(sid, updated, session.call_facts)
 
     async def send(evt: dict):
         await ws.send_text(json.dumps(evt))
@@ -1272,11 +1507,15 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
     session.reply_audio_started = False
 
     # Quiet filler only if real reply TTS is still late after FILLER_DELAY_MS.
+    # Skip during speculate — audio must not reach the phone before commit.
     if session._filler_task and not session._filler_task.done():
         session._filler_task.cancel()
-    session._filler_task = asyncio.create_task(
-        _delayed_filler(session, send, turn_id, text)
-    )
+    if not speculative:
+        session._filler_task = asyncio.create_task(
+            _delayed_filler(session, send, turn_id, text)
+        )
+    else:
+        session._filler_task = None
 
     await send({"type": "llm_start", "model": session.model})
 
@@ -1290,10 +1529,15 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
         route_task.cancel()
         return
 
-    # Prepare LLM call with current state's prompt
-    system_prompt = session.build_system_prompt()
+    # Prepare LLM call: static pack cached; coach/facts uncached.
+    system_prompt = session.build_static_system_prompt()
+    dynamic_system = session.build_dynamic_system_suffix()
+    base_messages = session.conversation.get_messages(model=session.model)
+    if speculative:
+        # Ephemeral user turn — history commit happens on stop_stt HIT.
+        base_messages = list(base_messages) + [{"role": "user", "content": text}]
     messages = _messages_with_operator_directives(
-        session.conversation.get_messages(model=session.model),
+        base_messages,
         session.operator_directives,
     )
     params = session.get_model_params()
@@ -1326,6 +1570,15 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
                     return
                 if not session.tts_enabled or not turn_active(turn_id):
                     continue
+
+                # Hangover soft turn: wait for stop_stt commit before any audio.
+                if not session.tts_release.is_set():
+                    try:
+                        await session.tts_release.wait()
+                    except asyncio.CancelledError:
+                        return
+                    if not turn_active(turn_id):
+                        continue
 
                 batch = [sentence]
                 ended = False
@@ -1378,6 +1631,7 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
             system_prompt=system_prompt,
             messages=messages,
             params=params,
+            dynamic_system=dynamic_system,
         ):
             if not turn_active(turn_id):
                 break
@@ -1443,9 +1697,15 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
                 pass
 
         # Rebuild with new state's prompt and restart LLM
-        system_prompt = session.build_system_prompt()
+        system_prompt = session.build_static_system_prompt()
+        dynamic_system = session.build_dynamic_system_suffix()
+        base_messages = session.conversation.get_messages(model=session.model)
+        if speculative and session._speculate_user_pending:
+            base_messages = list(base_messages) + [
+                {"role": "user", "content": session._speculate_user_pending}
+            ]
         messages = _messages_with_operator_directives(
-            session.conversation.get_messages(model=session.model),
+            base_messages,
             session.operator_directives,
         )
         params = session.get_model_params()
@@ -1468,6 +1728,7 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
                 system_prompt=system_prompt,
                 messages=messages,
                 params=params,
+                dynamic_system=dynamic_system,
             ):
                 if not turn_active(turn_id):
                     break
@@ -1509,6 +1770,21 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
             consumer_task.cancel()
         return
 
+    # Speculative turn cancelled before commit — do not write history or speak.
+    if speculative and session.speculate_active and not session.tts_release.is_set():
+        # Still waiting for hangover commit; block finalize until released/cancelled.
+        try:
+            await asyncio.wait_for(session.tts_release.wait(), timeout=2.5)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] Speculate commit timed out; dropping soft turn", sid)
+            if consumer_task and not consumer_task.done():
+                consumer_task.cancel()
+            return
+        if not turn_active(turn_id):
+            if consumer_task and not consumer_task.done():
+                consumer_task.cancel()
+            return
+
     # Flush remaining sentence buffer to TTS
     if session.tts_enabled and sentence_buffer.strip():
         sentences_queued.append(sentence_buffer.strip())
@@ -1518,6 +1794,10 @@ async def handle_user_text(session: ChatSession, ws: WebSocket, text: str):
 
     # Keep wire tokens in llm_done for AnswerBot; strip from history/TTS memory.
     history_text = _strip_wire_tokens(full_response) or full_response
+    # Soft turn may have committed the user message at stop_stt; ensure it exists.
+    if speculative and session._speculate_user_pending:
+        session.conversation.add_or_coalesce_user_message(session._speculate_user_pending)
+        session._speculate_user_pending = ""
     session.conversation.add_assistant_message(history_text, model=session.model)
     if full_response.strip():
         asst_updated = call_facts_svc.extract_from_assistant(
@@ -1588,23 +1868,13 @@ async def _dispatch_tts(
     if instruct:
         logger.info("[%s] TTS instruct=%r text=%r", session.id, instruct[:80], text[:60])
     try:
-        # Prefer instruct-capable client when delivery guidance is set; otherwise
-        # keep the pooled v2 client for lower reconnect latency.
-        if instruct:
-            stream = stream_tts_with_instruct(
-                text,
-                voice_id=voice_id,
-                language=language,
-                instruct=instruct,
-                turn_id=str(turn_id),
-            )
-        else:
-            stream = stream_tts_v2(
-                text,
-                voice_id=voice_id,
-                language=language,
-            )
-        async for event in stream:
+        async for event in stream_tts(
+            text,
+            voice_id=voice_id,
+            language=language,
+            instruct=instruct,
+            turn_id=str(turn_id),
+        ):
             if session.generation_turn != turn_id:
                 return
             if isinstance(event, TTSInstability):

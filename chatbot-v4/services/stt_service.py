@@ -241,6 +241,10 @@ class AudioRecorder:
         if self.active:
             self._chunks.append(bytes(data))
 
+    def snapshot(self) -> List[bytes]:
+        """Copy buffered PCM without ending the recording (hangover speculate)."""
+        return list(self._chunks)
+
     def stop(self) -> List[bytes]:
         self.active = False
         return list(self._chunks)
